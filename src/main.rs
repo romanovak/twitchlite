@@ -1564,7 +1564,7 @@ fn ensure_libmpv() {
         eprintln!("No se pudo descargar libmpv-2.dll — el video no estará disponible.");
         return;
     };
-    if let Ok(buf) = resp.body_mut().with_config().limit(80 << 20).read_to_vec() {
+    if let Ok(buf) = resp.body_mut().with_config().limit(256 << 20).read_to_vec() {
         let _ = std::fs::write(&dll, &buf);
         eprintln!("libmpv-2.dll descargado ({:.1} MB)", buf.len() as f64 / 1e6);
     }
