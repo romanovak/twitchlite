@@ -15,9 +15,11 @@ Built with Rust, egui/eframe (OpenGL), and libmpv for video playback.
 - Animated emotes (GIF/WebP) with atlas packing
 - Twemoji rendering
 - Channel points, drops, subscriptions, notifications
-- Ad detection and clean stream bypass
+- Ad detection, automatic freeze recovery, and return to live playback
+- Compact purple refresh control below the video, with a pulse when recovery is needed
+- Native desktop notifications with Twitch Lite branding
 - Theater mode, always-on-top, chat overlay
-- Keyboard shortcuts (K/Space, M, F, T, C)
+- Keyboard shortcuts (K/Space, M, F, T, C, F5 to refresh)
 - Custom dark theme matching Twitch's design
 - Portable: single exe + libmpv-2.dll, no installer
 
@@ -59,7 +61,32 @@ You can watch any public stream and read chat without logging in. Login is neede
 
 ## Configuration
 
-Config is saved at `%APPDATA%\TwitchLite\config.json`. Image cache at `%LOCALAPPDATA%\TwitchLite\cache` (200 MB limit, auto-pruned).
+Config is saved at `%APPDATA%\TwitchLite\config.json`. Diagnostic logs are in `%APPDATA%\TwitchLite\twitchlite.log`. Image cache is at `%LOCALAPPDATA%\TwitchLite\cache` (200 MB limit, auto-pruned).
+
+### Refresh and recovery
+
+The purple refresh icon sits next to Share in the channel information below the video. It pulses when playback stops advancing, a retry is pending, or the player falls far behind live. It remains steady during normal playback. Hover for the tooltip, or press F5 to renew the playback session and return to live.
+
+The player retries freezes automatically and reconnects when an ad break ends. Manual pause and rewind are respected. Network failures use increasing retry delays. Recovery depends on Twitch and the network; an uninterrupted stream or an ad-free alternative is not guaranteed.
+
+### Validation
+
+```powershell
+cargo test --locked
+```
+
+The tests cover frozen video with advancing audio, startup, retry delays, intentional pause, the refresh attention state, and an ad playlist interrupted by a simulated network failure.
+
+For a manual recovery check with the actual libmpv runtime, launch a single app instance with local diagnostic IPC enabled, then run the helper:
+
+```powershell
+$env:TWITCHLITE_MPV_IPC = '\\.\pipe\twitchlite-qa'
+Start-Process .\dist\twitchlite.exe
+.\scripts\test-recovery.ps1
+Remove-Item Env:TWITCHLITE_MPV_IPC
+```
+
+The helper deliberately pauses mpv, verifies that the app reconnects without a manual refresh, and checks that playback advances afterward. Close and reopen the app normally after the check; IPC is disabled unless the environment variable is set. Verbose mpv logging is opt-in through `TWITCHLITE_MPV_LOG`; keep those logs private because playback URLs can contain session tokens.
 
 ## Architecture
 
@@ -70,6 +97,8 @@ Config is saved at `%APPDATA%\TwitchLite\config.json`. Image cache at `%LOCALAPP
 | `twitch.rs` | Twitch API (GQL + Helix), IRC chat, auth, HLS |
 | `mpv.rs` | libmpv FFI: loads DLL at runtime, OpenGL FBO rendering |
 | `img.rs` | Image engine: SIEVE cache, worker threads, atlas packing |
+| `playback.rs` | Playback health, retry timing, live latency, refresh attention state |
+| `notifications.rs` | Native notifications and Windows application identity |
 
 ## License
 

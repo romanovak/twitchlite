@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod img;
 mod mpv;
+mod notifications;
+mod playback;
 mod twitch;
 mod ui;
 
@@ -9,11 +11,13 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
-use twitch::{Auth, ChanInfo, DropItem, Emote, Ev, Game, Identity, Live, Net, Notif, Reward, SubItem, UserCard};
+use twitch::{Auth, ChanInfo, Clip, DropItem, Emote, Ev, Game, Identity, Live, Net, Notif, Reward, SubItem, UserCard, Video};
 
 pub fn tlog(msg: &str) {
     use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("twitchlite.log") else { return };
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let path = PATH.get_or_init(|| cfg_path().with_file_name("twitchlite.log"));
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let _ = writeln!(f, "[{now}] {msg}");
 }
@@ -184,7 +188,9 @@ enum Page {
     Subs,
 }
 
-pub fn sort_str(i: u8) -> &'static str { if i == 1 { "RECENT" } else { "VIEWER_COUNT" } }
+pub fn sort_str(i: u8) -> &'static str {
+    match i { 1 => "VIEWER_COUNT_ASC", 2 => "RECENT", 3 => "RELEVANCE", _ => "VIEWER_COUNT" }
+}
 
 /// Texto -> partes. Emotes nativos por índice (tag `emotes`), los de 7TV/BTTV/FFZ por palabra,
 /// emoji Unicode a Twemoji y links aparte.
@@ -340,7 +346,9 @@ fn hwnd_of(cc: &eframe::CreationContext) -> isize {
 /// trabar la UI mientras el sistema la muestra.
 fn toast(title: String, body: String) {
     std::thread::spawn(move || {
-        let _ = notify_rust::Notification::new().appname("Twitch Lite").summary(&title).body(&body).show();
+        if let Err(e) = notifications::show(&title, &body) {
+            tlog(&format!("Notification error: {e}"));
+        }
     });
 }
 
@@ -399,9 +407,11 @@ struct App {
     related: (String, Vec<Live>), // "Más en {juego}" del sidebar: directos de la categoría que estás viendo
     follow_tab: u8,               // Siguiendo: 0 en directo, 1 canales
     explore_tab: u8,              // Explorar: 0 categorías, 1 canales en directo
-    explore_sort: u8,             // 0 = espectadores, 1 = recientes
+    explore_sort: u8,             // 0 = más viewers, 1 = menos viewers, 2 = recientes
+    explore_lang: String,         // filtro de idioma ("ES", "EN", etc.), vacío = todos
     cat_sort: u8,
     cat_tag: String,              // tag seleccionado para filtrar en categoría
+    cat_lang: String,
     my_emotes: Vec<(String, String)>,
     picker: bool,
     picker_tab: u8,
@@ -433,7 +443,11 @@ struct App {
     hero_dir: f32,   // 1 avanza, -1 retrocede
     follow_more: bool, // "Mostrar más" en la rejilla de Siguiendo
     chat_content_h: f32,
-    about_open: bool,
+    chan_tab: u8, // 0=Inicio/About, 1=Clips, 2=Vídeos
+    clips: Vec<Clip>,
+    videos: Vec<Video>,
+    clips_loaded: bool,
+    videos_loaded: bool,
     jump_bottom: bool,
     theater: bool,
     get_proc: Option<mpv::GetProc>,
@@ -450,7 +464,12 @@ struct App {
     playing: String, // variante que está sonando (la elige Auto o el usuario)
     want_h: u32,     // alto del player en px físicos, lo actualiza la UI
     auto_t: Option<Instant>,
-    ad_detected: bool,
+    stream_id: u64,
+    stream_pending: Option<Instant>,
+    health: playback::Health,
+    health_t: Instant,
+    ad_monitor: Option<twitch::AdMonitor>,
+    ad_detected: bool, // anuncio detectado en el HLS
     ad_player: Option<mpv::Player>, // segundo player para el anuncio en PiP
     ad_muted: bool,
 }
@@ -464,7 +483,7 @@ impl App {
         if let Some(raw) = std::env::var_os("TWITCHLITE_IMPORT").and_then(|p| std::fs::read_to_string(p).ok()) {
             twitch::import_web(&net, raw);
         }
-        twitch::load_top(&net, "VIEWER_COUNT");
+        twitch::load_top(&net, "VIEWER_COUNT", "");
         let ppp = cc.egui_ctx.pixels_per_point();
         let px = |pt: f32| (pt * ppp).round() as u32;
         let mut store = img::Store::new(cc.egui_ctx.clone(), IMG_BUDGET);
@@ -517,8 +536,10 @@ impl App {
             follow_tab: 0,
             explore_tab: 0,
             explore_sort: 0,
+            explore_lang: String::new(),
             cat_sort: 0,
             cat_tag: String::new(),
+            cat_lang: String::new(),
             my_emotes: Vec::new(),
             picker: false,
             picker_tab: 0,
@@ -550,7 +571,11 @@ impl App {
             hero_dir: 1.0,
             follow_more: false,
             chat_content_h: 0.0,
-            about_open: false,
+            chan_tab: 0,
+            clips: Vec::new(),
+            videos: Vec::new(),
+            clips_loaded: false,
+            videos_loaded: false,
             jump_bottom: false,
             theater: false,
             get_proc: cc.get_proc_address.clone(),
@@ -567,6 +592,11 @@ impl App {
             playing: String::new(),
             want_h: 720,
             auto_t: None,
+            stream_id: 0,
+            stream_pending: None,
+            health: playback::Health::new(Instant::now()),
+            health_t: Instant::now(),
+            ad_monitor: None,
             ad_detected: false,
             ad_player: None,
             ad_muted: true,
@@ -599,7 +629,16 @@ impl App {
             self.emotes.clear();
             self.chan_emotes.clear();
             self.info = ChanInfo::default();
+            self.chan_tab = 0;
+            self.clips.clear();
+            self.videos.clear();
+            self.clips_loaded = false;
+            self.videos_loaded = false;
             self.ad_detected = false;
+            self.ad_monitor = None;
+            self.stream_id = self.stream_id.wrapping_add(1);
+            self.stream_pending = None;
+            self.health = playback::Health::new(Instant::now());
             self.ad_player = None;
             self.ad_muted = true;
             self.qualities.clear();
@@ -613,7 +652,7 @@ impl App {
                 p.stop();
             }
             if self.cfg.video {
-                twitch::load_stream(&self.net, c.clone(), self.session());
+                self.request_stream(c.clone(), "cambio de canal");
             }
             twitch::load_info(&self.net, c.clone());
             twitch::load_badges(&self.net, c.clone(), self.hi);
@@ -637,7 +676,8 @@ impl App {
             Page::Category(g) => {
                 self.cat_streams = (g.clone(), Vec::new());
                 self.cat_tag.clear();
-                twitch::load_streams(&self.net, g.clone(), sort_str(self.cat_sort));
+                self.cat_lang.clear();
+                twitch::load_streams(&self.net, g.clone(), sort_str(self.cat_sort), "");
             }
             Page::Following => {
                 if let Some(a) = &self.me {
@@ -931,7 +971,7 @@ impl App {
                         let c = self.chan.clone();
                         self.join(&c); // reconecta el chat con tu cuenta
                         if self.cfg.video && a.web {
-                            twitch::load_stream(&self.net, c, self.session()); // video a tu nombre (sin anuncios si eres sub/Turbo)
+                            self.request_stream(c, "sesión actualizada");
                         }
                     }
                 }
@@ -996,19 +1036,22 @@ impl App {
                     // categoría nueva: pide sus directos para "Más en {juego}" del sidebar
                     if !info.game.is_empty() && info.game != self.related.0 {
                         self.related = (info.game.clone(), Vec::new());
-                        twitch::load_streams(&self.net, info.game.clone(), "VIEWER_COUNT");
+                        twitch::load_streams(&self.net, info.game.clone(), "VIEWER_COUNT", "");
                     }
                     self.info = info;
                 }
             }
-            Ev::Stream(c, _) if c != self.chan || !self.cfg.video => {}
-            Ev::Stream(_, Err(e)) => {
+            Ev::Stream(c, id, _) if c != self.chan || id != self.stream_id || !self.cfg.video => {}
+            Ev::Stream(_, _, Err(e)) => {
                 tlog(&format!("Stream error: {e}"));
-                self.status = e;
+                self.stream_pending = None;
+                self.health.failed(Instant::now());
+                self.status = format!("{e}. Reintentando automáticamente…");
                 self.qualities.clear();
             }
-            Ev::Stream(_, Ok(q)) => {
+            Ev::Stream(_, _, Ok(q)) => {
                 tlog(&format!("Stream OK: {} qualities", q.len()));
+                self.stream_pending = None;
                 self.status.clear();
                 self.qualities = q;
                 if self.player.is_none() {
@@ -1031,31 +1074,46 @@ impl App {
                         p.set("mute", "yes");
                     }
                     self.playing = q.0;
-                    self.paused = false;
+                    p.set("pause", if self.paused { "yes" } else { "no" });
+                    if self.vid_off { p.set("vid", "no"); }
+                    self.rewound = false;
+                    self.buffer = 0.0;
+                    self.health.loaded(Instant::now());
                 }
                 if let Some(url) = self.qualities.last().map(|q| q.1.clone()) {
-                    twitch::start_ad_monitor(&self.net, url);
+                    self.ad_monitor = Some(twitch::start_ad_monitor(&self.net, url, self.stream_id, self.ad_detected));
                 }
             }
-            Ev::AdStatus(is_ad) => {
+            Ev::Clips(c, list) if c == self.chan => { self.clips = list; self.clips_loaded = true; }
+            Ev::Clips(..) => {}
+            Ev::Videos(c, list) if c == self.chan => { self.videos = list; self.videos_loaded = true; }
+            Ev::Videos(..) => {}
+            Ev::AdStatus(id, _) if id != self.stream_id || !self.cfg.video => {}
+            Ev::AdStatus(_, is_ad) => {
                 tlog(&format!("AdStatus: {is_ad} (was {})", self.ad_detected));
-                if is_ad && !self.ad_detected {
-                    tlog("Requesting clean stream");
-                    twitch::load_stream_clean(&self.net, self.chan.clone());
-                }
+                let ended = self.ad_detected && !is_ad;
                 self.ad_detected = is_ad;
+                // El cambio automático a un token anónimo podía dejar a mpv en una URL agotada.
+                // Al terminar el bloque se renuevan token y playlist de la sesión actual.
+                if ended && !self.paused && !self.rewound && self.stream_pending.is_none() {
+                    self.request_stream(self.chan.clone(), "fin del anuncio");
+                }
             }
-            Ev::CleanStream(c, _) if c != self.chan => {}
-            Ev::CleanStream(_, Err(e)) => {
+            Ev::CleanStream(c, id, _) if c != self.chan || id != self.stream_id || !self.cfg.video || self.stream_pending.is_some() => {}
+            Ev::CleanStream(_, _, Err(e)) => {
                 tlog(&format!("CleanStream error: {e}"));
-                self.status = format!("Ad skip: {e}");
             }
-            Ev::CleanStream(_, Ok(q)) => {
+            Ev::CleanStream(_, _, Ok(q)) => {
                 let pick = q.iter().find(|x| x.0 == self.playing).or(q.first());
                 tlog(&format!("CleanStream OK: {} qualities, picking {:?}", q.len(), pick.map(|p| &p.0)));
                 if let Some(p) = &self.player {
                     if let Some(clean) = pick {
                         p.play(&clean.1);
+                        p.set("speed", "1");
+                        p.set("pause", if self.paused { "yes" } else { "no" });
+                        self.catching_up = false;
+                        self.rewound = false;
+                        self.health.loaded(Instant::now());
                     }
                 }
             }
@@ -1169,19 +1227,24 @@ impl App {
         self.cfg.save();
         if on {
             if !self.chan.is_empty() {
-                twitch::load_stream(&self.net, self.chan.clone(), self.session());
+                self.request_stream(self.chan.clone(), "video activado");
             }
-        } else if let Some(gl) = gl {
-            if let Some(ap) = self.ad_player.take() { ap.destroy(gl); }
-            if let Some(p) = self.player.take() { p.destroy(gl); }
-            self.qualities.clear();
-            self.playing.clear();
+        } else {
+            self.ad_monitor = None;
+            self.stream_id = self.stream_id.wrapping_add(1);
+            self.stream_pending = None;
+            if let Some(gl) = gl {
+                if let Some(ap) = self.ad_player.take() { ap.destroy(gl); }
+                if let Some(p) = self.player.take() { p.destroy(gl); }
+                self.qualities.clear();
+                self.playing.clear();
+            }
         }
     }
 
     /// En Auto, cambia de variante si el tamaño del player lo pide por 3 s seguidos (evita rebotes al redimensionar).
     fn auto_quality(&mut self, ctx: &egui::Context) {
-        if self.cfg.quality != "Auto" || self.player.is_none() || self.chan.is_empty() {
+        if self.cfg.quality != "Auto" || self.player.is_none() || self.chan.is_empty() || self.stream_pending.is_some() || self.paused || self.rewound {
             return;
         }
         let Some(best) = auto_pick(&self.qualities, self.want_h).cloned() else { return };
@@ -1196,6 +1259,9 @@ impl App {
             }
             self.playing = best.0;
             self.paused = false;
+            self.health.loaded(Instant::now());
+            self.catching_up = false;
+            if let Some(p) = &self.player { p.set("speed", "1"); }
             self.auto_t = None;
         } else {
             ctx.request_repaint_after(Duration::from_secs(3));
@@ -1232,13 +1298,53 @@ impl App {
         Some((start, pos, end))
     }
 
-    /// "Ir al directo": recarga la variante actual, que arranca en el borde del directo.
+    fn request_stream(&mut self, chan: String, reason: &str) {
+        self.stream_id = self.stream_id.wrapping_add(1);
+        self.stream_pending = Some(Instant::now());
+        self.ad_monitor = None;
+        self.auto_t = None;
+        self.status = "Reconectando al directo…".into();
+        self.controls_t = Instant::now();
+        tlog(&format!("Refresh #{}: {reason}", self.stream_id));
+        twitch::load_stream(&self.net, chan, self.session(), self.stream_id);
+        self.net.ctx.request_repaint();
+    }
+
+    /// Renueva también token y playlist; reutilizar la URL anterior no recupera sesiones agotadas.
     fn go_live(&mut self) {
-        let url = self.qualities.iter().find(|q| q.0 == self.playing).map(|q| q.1.clone());
-        if let (Some(p), Some(u)) = (&self.player, url) {
-            p.play(&u);
-            self.paused = false;
-            self.rewound = false;
+        if self.chan.is_empty() || !self.cfg.video || self.stream_pending.is_some() { return; }
+        self.paused = false;
+        self.rewound = false;
+        self.request_stream(self.chan.clone(), "refresh manual / ir al directo");
+    }
+
+    fn playback_health(&mut self, ctx: &egui::Context) {
+        if !self.cfg.video || self.chan.is_empty() { return; }
+        // Necesario aun cuando mpv se queda congelado y deja de pedir cuadros.
+        ctx.request_repaint_after(Duration::from_secs(1));
+        let now = Instant::now();
+        if now.duration_since(self.health_t) < Duration::from_secs(1) { return; }
+        self.health_t = now;
+        if let Some(started) = self.stream_pending {
+            if now.duration_since(started) >= Duration::from_secs(40) {
+                self.stream_id = self.stream_id.wrapping_add(1);
+                self.stream_pending = None;
+                self.health.failed(now);
+                self.status = "Twitch no respondió. Reintentando automáticamente…".into();
+            }
+            return;
+        }
+        let pos = self.player.as_ref().and_then(|p| p.num("time-pos"));
+        let video = self.player.as_ref().and_then(|p| p.frame_serial());
+        // Al navegar a otra página no se dibuja la textura; el audio se sigue vigilando.
+        let expect_video = !self.vid_off && self.page == Page::Channel && self.playing != "audio_only";
+        let suspended = self.paused || self.rewound;
+        let stuck = self.health.sample(now, pos, video, expect_video, suspended);
+        let buffer = self.player.as_ref().and_then(|p| p.num("demuxer-cache-duration")).unwrap_or(0.0);
+        let behind = self.health.behind(now, buffer, self.cfg.low_latency && !suspended);
+        let ended = !suspended && self.player.as_ref().is_some_and(|p| p.flag("eof-reached") || p.flag("idle-active"));
+        if stuck || behind || (ended && self.health.ended(now)) {
+            self.request_stream(self.chan.clone(), if behind { "volver al borde del directo" } else { "reproducción detenida / reintento" });
         }
     }
 
@@ -1257,11 +1363,18 @@ impl App {
             }
         }
         self.paused = false;
+        self.rewound = false;
+        self.catching_up = false;
+        self.health.loaded(Instant::now());
+        if let Some(p) = &self.player { p.set("speed", "1"); }
         self.cfg.save();
     }
 
     /// Atajos como en twitch.tv (solo si no estás escribiendo).
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.page == Page::Channel && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            self.go_live();
+        }
         if ctx.egui_wants_keyboard_input() || self.page != Page::Channel {
             return;
         }
@@ -1306,7 +1419,9 @@ impl eframe::App for App {
             if let Some(p) = &self.player {
                 p.set("vid", if minimized { "no" } else { "auto" });
             }
+            self.health.loaded(Instant::now());
         }
+        self.playback_health(ctx);
         // Buscador: espera 300 ms sin teclear antes de pedir sugerencias
         if let Some(t) = self.search_t {
             if t.elapsed() >= Duration::from_millis(300) {
@@ -1329,7 +1444,7 @@ impl eframe::App for App {
         // cada minuto: sidebar y aviso de canales que entran en vivo
         if self.side_t.elapsed() >= Duration::from_secs(60) {
             self.side_t = Instant::now();
-            twitch::load_top(&self.net, "VIEWER_COUNT");
+            twitch::load_top(&self.net, "VIEWER_COUNT", "");
             if let Some(a) = &self.me {
                 twitch::load_follows(&self.net, a.clone());
             }
@@ -1427,7 +1542,8 @@ mod tests {
     #[test]
     #[ignore]
     fn toast_shows() {
-        notify_rust::Notification::new().appname("Twitch Lite").summary("Someone mentioned you in #testchannel").body("Notification test for Twitch Lite").show().unwrap();
+        notifications::init();
+        notifications::show("Te mencionaron en #testchannel", "Prueba de notificación de Twitch Lite").unwrap();
     }
 
     #[test]
@@ -1460,6 +1576,7 @@ fn main() -> eframe::Result {
     }));
     tlog("=== START ===");
     ensure_libmpv();
+    notifications::init();
     let cfg = Cfg::load();
     // sin marco de Windows: la barra superior de la app hace de barra de título (ver ui::top_bar)
     let mut vp = egui::ViewportBuilder::default().with_title("Twitch Lite").with_inner_size([1280.0, 720.0]).with_min_inner_size([360.0, 240.0]).with_decorations(false);

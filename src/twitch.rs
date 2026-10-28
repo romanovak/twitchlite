@@ -107,6 +107,7 @@ pub struct ChanInfo {
     pub tags: Vec<String>,
     pub partner: bool,
     pub panels: Vec<Panel>,
+    pub socials: Vec<(String, String, String)>, // (name, title, url)
 }
 
 /// Panel de "Acerca de" del canal (imagen con enlace y/o texto).
@@ -116,6 +117,26 @@ pub struct Panel {
     pub image: String,
     pub link: String,
     pub desc: String,
+}
+
+pub struct Clip {
+    pub slug: String,
+    pub title: String,
+    pub views: u64,
+    pub duration: u32,
+    pub thumb: String,
+    pub game: String,
+    pub curator: String,
+}
+
+pub struct Video {
+    pub id: String,
+    pub title: String,
+    pub views: u64,
+    pub length: u32,
+    pub thumb: String,
+    pub game: String,
+    pub date: String,
 }
 
 pub struct Reward {
@@ -151,7 +172,7 @@ pub enum Ev {
     Top(Vec<Live>),
     Avatar(String),
     MyEmotes(Vec<(String, String)>),
-    Stream(String, Result<Vec<(String, String)>, String>),
+    Stream(String, u64, Result<Vec<(String, String)>, String>),
     Info(String, ChanInfo),
     Points(String, u64),
     Bits(u64),
@@ -164,8 +185,10 @@ pub enum Ev {
     Games(Vec<Game>),
     Streams(Option<String>, Vec<Live>),
     Search(String, Vec<Live>),
-    AdStatus(bool),
-    CleanStream(String, Result<Vec<(String, String)>, String>),
+    Clips(String, Vec<Clip>),
+    Videos(String, Vec<Video>),
+    AdStatus(u64, bool),
+    CleanStream(String, u64, Result<Vec<(String, String)>, String>),
 }
 
 // ---------- Secretos: Administrador de credenciales de Windows / Llavero de macOS ----------
@@ -308,7 +331,7 @@ fn gql_str(s: &str) -> String {
 /// Título, juego, espectadores y avatar del canal (sin login). Se vuelve a pedir cada minuto.
 pub fn load_info(net: &Net, chan: String) {
     net.spawn(move |net| {
-        let q = format!("query{{user(login:{}){{displayName profileImageURL(width:70) description followers{{totalCount}} roles{{isPartner}} panels{{type ... on DefaultPanel{{title imageURL linkURL description}}}} broadcastSettings{{title game{{displayName}}}} stream{{viewersCount createdAt freeformTags{{name}} game{{displayName}}}}}}}}", gql_str(&chan));
+        let q = format!("query{{user(login:{}){{displayName profileImageURL(width:70) description followers{{totalCount}} roles{{isPartner}} channel{{socialMedias{{name url title}}}} panels{{type ... on DefaultPanel{{title imageURL linkURL description}}}} broadcastSettings{{title game{{displayName}}}} stream{{viewersCount createdAt freeformTags{{name}} game{{displayName}}}}}}}}", gql_str(&chan));
         let Some(v) = gql_q(&q) else { return };
         let u = &v["data"]["user"];
         let live = !u["stream"].is_null();
@@ -325,8 +348,34 @@ pub fn load_info(net: &Net, chan: String) {
             partner: u["roles"]["isPartner"].as_bool().unwrap_or(false),
             // paneles del canal (los de extensión no se pueden mostrar fuera de la web)
             panels: u["panels"].as_array().into_iter().flatten().filter(|p| s(&p["type"]) == "DEFAULT").map(|p| Panel { title: s(&p["title"]), image: s(&p["imageURL"]), link: s(&p["linkURL"]), desc: s(&p["description"]) }).collect(),
+            socials: u["channel"]["socialMedias"].as_array().into_iter().flatten().map(|sm| (s(&sm["name"]), s(&sm["title"]), s(&sm["url"]))).collect(),
         };
         net.send(Ev::Info(chan, info));
+    });
+}
+
+pub fn load_clips(net: &Net, login: String, period: &str) {
+    let period = period.to_string();
+    net.spawn(move |net| {
+        let q = format!("query{{user(login:{}){{clips(first:20,criteria:{{period:{period}}}){{edges{{node{{slug title viewCount durationSeconds thumbnailURL game{{displayName}} curator{{displayName}}}}}}}}}}}}", gql_str(&login));
+        let Some(v) = gql_q(&q) else { return };
+        let clips = v["data"]["user"]["clips"]["edges"].as_array().into_iter().flatten().map(|e| {
+            let n = &e["node"];
+            Clip { slug: s(&n["slug"]), title: clean(&s(&n["title"])), views: n["viewCount"].as_u64().unwrap_or(0), duration: n["durationSeconds"].as_u64().unwrap_or(0) as u32, thumb: s(&n["thumbnailURL"]), game: s(&n["game"]["displayName"]), curator: s(&n["curator"]["displayName"]) }
+        }).collect();
+        net.send(Ev::Clips(login, clips));
+    });
+}
+
+pub fn load_videos(net: &Net, login: String) {
+    net.spawn(move |net| {
+        let q = format!("query{{user(login:{}){{videos(first:20,sort:TIME,type:ARCHIVE){{edges{{node{{id title viewCount createdAt lengthSeconds previewThumbnailURL(width:320,height:180) game{{displayName}}}}}}}}}}}}", gql_str(&login));
+        let Some(v) = gql_q(&q) else { return };
+        let vids = v["data"]["user"]["videos"]["edges"].as_array().into_iter().flatten().map(|e| {
+            let n = &e["node"];
+            Video { id: s(&n["id"]), title: clean(&s(&n["title"])), views: n["viewCount"].as_u64().unwrap_or(0), length: n["lengthSeconds"].as_u64().unwrap_or(0) as u32, thumb: s(&n["previewThumbnailURL"]), game: s(&n["game"]["displayName"]), date: s(&n["createdAt"]) }
+        }).collect();
+        net.send(Ev::Videos(login, vids));
     });
 }
 
@@ -357,21 +406,23 @@ fn streams_from(edges: &Value) -> Vec<Live> {
 }
 
 /// "Canales en directo": los más vistos ahora mismo (sin login). Sidebar y página principal.
-/// sort: "VIEWER_COUNT" (default) o "RECENT".
-pub fn load_top(net: &Net, sort: &str) {
+pub fn load_top(net: &Net, sort: &str, lang: &str) {
     let sort = sort.to_string();
+    let lang = lang.to_string();
     net.spawn(move |net| {
-        let v = gql_q(&format!("query{{streams(first:24,options:{{sort:{sort}}}){{edges{{node{{{STREAM_FIELDS}}}}}}}}}")).unwrap_or_default();
+        let lang_filter = if lang.is_empty() { String::new() } else { format!(",broadcasterLanguages:[{lang}]") };
+        let v = gql_q(&format!("query{{streams(first:24,options:{{sort:{sort}{lang_filter}}}){{edges{{node{{{STREAM_FIELDS}}}}}}}}}")).unwrap_or_default();
         net.send(Ev::Top(streams_from(&v["data"]["streams"]["edges"])));
     });
 }
 
 /// Directos de una categoría.
-/// sort: "VIEWER_COUNT" (default) o "RECENT".
-pub fn load_streams(net: &Net, game: String, sort: &str) {
+pub fn load_streams(net: &Net, game: String, sort: &str, lang: &str) {
     let sort = sort.to_string();
+    let lang = lang.to_string();
     net.spawn(move |net| {
-        let v = gql_q(&format!("query{{game(name:{}){{viewersCount streams(first:30,options:{{sort:{sort}}}){{edges{{node{{{STREAM_FIELDS}}}}}}}}}}}", gql_str(&game))).unwrap_or_default();
+        let lang_filter = if lang.is_empty() { String::new() } else { format!(",broadcasterLanguages:[{lang}]") };
+        let v = gql_q(&format!("query{{game(name:{}){{viewersCount streams(first:30,options:{{sort:{sort}{lang_filter}}}){{edges{{node{{{STREAM_FIELDS}}}}}}}}}}}", gql_str(&game))).unwrap_or_default();
         net.send(Ev::Streams(Some(game), streams_from(&v["data"]["game"]["streams"]["edges"])));
     });
 }
@@ -808,7 +859,7 @@ pub fn device_login(net: &Net, cid: String) {
 
 /// Con tu sesión de twitch.tv el token de reproducción sale a tu nombre: si estás suscrito al canal
 /// o tienes Turbo, Twitch no mete anuncios (igual que en la web).
-pub fn load_stream(net: &Net, chan: String, session: Option<String>) {
+pub fn load_stream(net: &Net, chan: String, session: Option<String>, request: u64) {
     net.spawn(move |net| {
         let q = "query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }";
         let body = json!({"operationName": "PlaybackAccessToken_Template", "query": q,
@@ -824,38 +875,49 @@ pub fn load_stream(net: &Net, chan: String, session: Option<String>) {
                 rnd() % 999_999, s(&t["signature"]), enc(&s(&t["value"]))
             );
             let m3u8 = agent().get(&url).call().map_err(|_| "Offline".to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
-            Ok(parse_master(&m3u8))
+            let qualities = parse_master(&m3u8);
+            if qualities.is_empty() { return Err("Twitch devolvió una playlist vacía".to_string()); }
+            Ok(qualities)
         })();
-        net.send(Ev::Stream(chan, res));
+        net.send(Ev::Stream(chan, request, res));
     });
 }
 
-/// Busca líneas `#EXT-X-DATERANGE` con CLASS que contenga "stitched-ad" — solo esas líneas
-/// indican un segmento de anuncio activo, no URLs u otros metadatos del playlist.
-pub fn start_ad_monitor(net: &Net, variant_url: String) {
+/// Al soltarlo se cancela el monitor anterior, incluso si nunca volvió a cambiar el anuncio.
+pub struct AdMonitor { _cancel: Sender<()> }
+
+pub fn start_ad_monitor(net: &Net, variant_url: String, request: u64, mut was_ad: bool) -> AdMonitor {
+    let (cancel, stop) = channel();
     net.spawn(move |net| {
-        let mut was_ad = false;
         loop {
-            thread::sleep(Duration::from_secs(3));
+            // Desconectar el sender despierta inmediatamente este hilo al cambiar de canal/URL.
+            if !matches!(stop.recv_timeout(Duration::from_secs(3)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { return; }
             let body = match agent().get(&variant_url).call().and_then(|mut r| Ok(r.body_mut().read_to_string()?)) {
                 Ok(b) => b,
                 Err(e) => {
-                    crate::tlog(&format!("AdMonitor: URL error ({e}), was_ad={was_ad}"));
-                    if was_ad { net.send(Ev::AdStatus(false)); }
-                    return;
+                    crate::tlog(&format!("AdMonitor: error de red ({e}); reintentando"));
+                    continue;
                 }
             };
-            let is_ad = body.lines().any(|l| l.starts_with("#EXT-X-DATERANGE") && l.contains("stitched-ad"));
+            if matches!(stop.try_recv(), Err(TryRecvError::Disconnected)) { return; }
+            let is_ad = playlist_has_ad(&body);
             if is_ad != was_ad {
                 crate::tlog(&format!("AdMonitor: {was_ad} → {is_ad}"));
                 was_ad = is_ad;
-                net.send(Ev::AdStatus(is_ad));
+                net.send(Ev::AdStatus(request, is_ad));
             }
         }
     });
+    AdMonitor { _cancel: cancel }
 }
 
-pub fn load_stream_clean(net: &Net, chan: String) {
+fn playlist_has_ad(body: &str) -> bool {
+    body.lines().filter_map(|l| l.strip_prefix("#EXT-X-DATERANGE:"))
+        .any(|l| l.split(',').any(|a| a.trim_start().starts_with("CLASS=\"") && a.contains("stitched-ad")))
+}
+
+/// pide un stream anónimo (playerType "embed") para reemplazar al principal cuando hay ad.
+pub fn load_stream_clean(net: &Net, chan: String, request: u64) {
     net.spawn(move |net| {
         let q = "query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }";
         let body = json!({"operationName": "PlaybackAccessToken_Template", "query": q,
@@ -871,7 +933,7 @@ pub fn load_stream_clean(net: &Net, chan: String) {
             let m3u8 = agent().get(&url).call().map_err(|_| "Offline".to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
             Ok(parse_master(&m3u8))
         })();
-        net.send(Ev::CleanStream(chan, res));
+        net.send(Ev::CleanStream(chan, request, res));
     });
 }
 
@@ -1000,6 +1062,45 @@ fn session(net: &Net, generation: u64, chan: &str, auth: Option<&Auth>, rx: &Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ad_markers_require_a_daterange_class() {
+        assert!(playlist_has_ad("#EXTM3U\n#EXT-X-DATERANGE:ID=\"1\",CLASS=\"twitch-stitched-ad\"\n"));
+        assert!(playlist_has_ad("#EXT-X-DATERANGE:CLASS=\"twitch-stitched-ad\",ID=\"1\"\n"));
+        assert!(!playlist_has_ad("#EXTM3U\nhttps://cdn/stitched-ad.ts\n"));
+        assert!(!playlist_has_ad("#EXT-X-DATERANGE:ID=\"stitched-ad\",CLASS=\"other\"\n"));
+    }
+
+    #[test]
+    fn ad_monitor_survives_network_errors_and_keeps_its_generation() {
+        use std::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/live.m3u8", server.local_addr().unwrap());
+        let serving = thread::spawn(move || {
+            for (status, body) in [
+                ("200 OK", "#EXTM3U\n#EXT-X-DATERANGE:ID=\"1\",CLASS=\"twitch-stitched-ad\"\n"),
+                ("503 Service Unavailable", "temporary outage"),
+                ("200 OK", "#EXTM3U\n#EXTINF:2,\nsegment.ts\n"),
+            ] {
+                let (mut socket, _) = server.accept().unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 0 {
+                    if line == "\r\n" { break; }
+                    line.clear();
+                }
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let (tx, rx) = channel();
+        let net = Net { tx, ctx: eframe::egui::Context::default() };
+        let monitor = start_ad_monitor(&net, url, 42, false);
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(8)).unwrap(), Ev::AdStatus(42, true)));
+        // Un 503 no inventa un fin de anuncio ni mata el monitor.
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ev::AdStatus(42, false)));
+        drop(monitor);
+        serving.join().unwrap();
+    }
 
     #[test]
     fn irc_and_master() {

@@ -58,6 +58,7 @@ pub struct Player {
     _gp: Box<GetProc>,
     _ctx: Box<egui::Context>,
     target: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [i32; 2])>,
+    frame_serial: u64,
 }
 
 fn cs(s: &str) -> CString {
@@ -104,6 +105,9 @@ impl Player {
                 ("profile", "fast"),
                 ("hwdec-extra-frames", "2"),
                 ("demuxer-readahead-secs", "6"),
+                // HLS: arranca cerca del borde y limita lecturas atascadas tras una discontinuidad.
+                ("demuxer-lavf-o", "live_start_index=-2"),
+                ("network-timeout", "10"),
                 ("vo", "libmpv"),
                 // Decodifica en GPU y copia el frame: sin esto mpv inicializa CUDA/Vulkan para interop (~1 GB comprometido)
                 ("hwdec", if cfg!(windows) { "d3d11va-copy" } else { "videotoolbox-copy" }),
@@ -124,6 +128,10 @@ impl Player {
             if let Ok(log) = std::env::var("TWITCHLITE_MPV_LOG") {
                 (api.set_option)(h, cs("log-file").as_ptr(), cs(&log).as_ptr());
             }
+            // Diagnóstico local opt-in para probar cortes con la DLL real, sin exponer IPC por defecto.
+            if let Ok(pipe) = std::env::var("TWITCHLITE_MPV_IPC") {
+                (api.set_option)(h, cs("input-ipc-server").as_ptr(), cs(&pipe).as_ptr());
+            }
             if (api.initialize)(h) < 0 {
                 (api.destroy)(h);
                 return Err("mpv_initialize falló".into());
@@ -143,7 +151,7 @@ impl Player {
                 return Err("mpv no pudo crear el contexto OpenGL".into());
             }
             (api.rc_callback)(rc, wake, &*ctx as *const egui::Context as *mut c_void);
-            Ok(Self { api, h, rc, _gp: gp, _ctx: ctx, target: None })
+            Ok(Self { api, h, rc, _gp: gp, _ctx: ctx, target: None, frame_serial: 0 })
         }
     }
 
@@ -167,6 +175,11 @@ impl Player {
         let r = unsafe { (self.api.get_property)(self.h, cs(k).as_ptr(), 5, &mut v as *mut f64 as *mut c_void) };
         (r >= 0).then_some(v)
     }
+    pub fn flag(&self, k: &str) -> bool {
+        let mut v: c_int = 0;
+        let r = unsafe { (self.api.get_property)(self.h, cs(k).as_ptr(), 3, &mut v as *mut c_int as *mut c_void) };
+        r >= 0 && v != 0
+    }
     /// Propiedad de texto (MPV_FORMAT_STRING); mpv la reserva y hay que liberarla con mpv_free.
     pub fn text(&self, k: &str) -> String {
         let mut p: *mut c_char = std::ptr::null_mut();
@@ -188,6 +201,9 @@ impl Player {
     }
     pub fn toggle_pause(&self) {
         self.cmd(&["cycle", "pause"]);
+    }
+    pub fn frame_serial(&self) -> Option<f64> {
+        (self.frame_serial > 0).then_some(self.frame_serial as f64)
     }
     /// Relación de aspecto del video actual (16:9 si aún no hay frame).
     pub fn aspect(&self) -> f32 {
@@ -218,7 +234,9 @@ impl Player {
                 gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
             }
             self.target = Some((fb, tex, id, px));
-            if resized || (self.api.rc_update)(self.rc) & 1 != 0 {
+            let updated = (self.api.rc_update)(self.rc) & 1 != 0;
+            if updated { self.frame_serial = self.frame_serial.wrapping_add(1); }
+            if resized || updated {
                 let mut f = Fbo { fbo: fb.0.get() as c_int, w: px[0], h: px[1], internal_format: 0 };
                 let mut flip: c_int = 0;
                 let mut params = [

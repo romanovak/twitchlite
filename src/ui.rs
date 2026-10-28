@@ -608,11 +608,12 @@ fn tag_pills(p: &Painter, pos: Pos2, tags: &[String], max_w: f32) {
     }
 }
 
+/// sort pills — devuelve true si cambió
 fn sort_pills(ui: &mut Ui, sel: &mut u8) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.add_space(30.0);
-        for (i, label) in ["Espectadores", "Recientes"].iter().enumerate() {
+        for (i, label) in ["Más espectadores", "Menos espectadores", "Recientes", "Recomendados"].iter().enumerate() {
             let on = *sel as usize == i;
             let (bg, fg) = if on { (PURPLE, Color32::WHITE) } else { (SIDE, DIM) };
             if ui.add(egui::Button::new(RichText::new(*label).font(FontId::proportional(13.0)).color(fg)).fill(bg).corner_radius(12)).clicked() && !on {
@@ -625,6 +626,40 @@ fn sort_pills(ui: &mut Ui, sel: &mut u8) -> bool {
     changed
 }
 
+const LANGUAGES: &[(&str, &str)] = &[
+    ("", "Todos"), ("ES", "Español"), ("EN", "English"), ("PT", "Português"),
+    ("FR", "Français"), ("DE", "Deutsch"), ("IT", "Italiano"), ("RU", "Русский"),
+    ("JA", "日本語"), ("KO", "한국어"), ("ZH", "中文"), ("AR", "العربية"),
+    ("TR", "Türkçe"), ("PL", "Polski"), ("NL", "Nederlands"), ("SV", "Svenska"),
+    ("DA", "Dansk"), ("NO", "Norsk"), ("FI", "Suomi"), ("HU", "Magyar"),
+    ("CS", "Čeština"), ("SK", "Slovenčina"), ("RO", "Română"), ("BG", "Български"),
+    ("UK", "Українська"), ("EL", "Ελληνικά"), ("TH", "ไทย"), ("VI", "Tiếng Việt"),
+    ("ID", "Bahasa"), ("HI", "हिन्दी"), ("TL", "Filipino"),
+];
+
+/// lang dropdown — devuelve true si cambió
+fn lang_pills(ui: &mut Ui, sel: &mut String) -> bool {
+    let mut changed = false;
+    let current = LANGUAGES.iter().find(|(c, _)| *c == sel.as_str()).map(|(_, l)| *l).unwrap_or("Todos");
+    ui.horizontal(|ui| {
+        ui.add_space(30.0);
+        ui.label(RichText::new("Idioma").font(FontId::proportional(13.0)).color(DIM));
+        egui::ComboBox::from_id_salt("lang")
+            .selected_text(RichText::new(current).font(FontId::proportional(13.0)))
+            .width(130.0)
+            .show_ui(ui, |ui| {
+                for (code, label) in LANGUAGES {
+                    if ui.selectable_label(sel.as_str() == *code, *label).clicked() {
+                        *sel = code.to_string();
+                        changed = true;
+                    }
+                }
+            });
+    });
+    changed
+}
+
+/// tag chips — devuelve true si la selección cambió
 fn tag_chips(ui: &mut Ui, tags: &[String], sel: &mut String) -> bool {
     if tags.is_empty() { return false; }
     let mut changed = false;
@@ -1136,8 +1171,10 @@ impl App {
                 page_title(ui, "Explorar");
                 tabs(ui, &["Categorías", "Canales en directo"], &mut self.explore_tab);
                 if self.explore_tab == 1 {
-                    if sort_pills(ui, &mut self.explore_sort) {
-                        twitch::load_top(&self.net, sort_str(self.explore_sort));
+                    let s = sort_pills(ui, &mut self.explore_sort);
+                    let l = lang_pills(ui, &mut self.explore_lang);
+                    if s || l {
+                        twitch::load_top(&self.net, sort_str(self.explore_sort), &self.explore_lang);
                     }
                     if let Some(c) = stream_grid(ui, &self.store, &self.top) {
                         go = Some(c);
@@ -1186,9 +1223,11 @@ impl App {
                     }
                 });
                 ui.add_space(10.0);
-                if sort_pills(ui, &mut self.cat_sort) {
+                let s = sort_pills(ui, &mut self.cat_sort);
+                let l = lang_pills(ui, &mut self.cat_lang);
+                if s || l {
                     self.cat_streams.1.clear();
-                    twitch::load_streams(&self.net, g.clone(), sort_str(self.cat_sort));
+                    twitch::load_streams(&self.net, g.clone(), sort_str(self.cat_sort), &self.cat_lang);
                 }
                 // tags de los streams como filtro
                 let mut all_tags: Vec<String> = self.cat_streams.1.iter().flat_map(|l| l.tags.iter().cloned()).collect();
@@ -1428,7 +1467,8 @@ impl App {
                         let c = self.search_res.iter().find(|l| l.login == typed).or(self.search_res.first()).map(|l| l.login.clone()).unwrap_or(typed);
                         self.join(&c);
                     }
-                    if r.has_focus() {
+                    // dropdown visible cuando hay resultados, no solo con foco
+                    if r.has_focus() || !self.search_res.is_empty() {
                         search_rect = fr.response.rect.union(br);
                     }
                 });
@@ -1494,20 +1534,30 @@ impl App {
         });
         // Sugerencias del buscador
         if search_rect.is_positive() && !self.search_res.is_empty() {
-            let mut go = None;
-            egui::Area::new(egui::Id::unique("search_res")).order(egui::Order::Foreground).fixed_pos(search_rect.left_bottom() + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).fill(PANEL).corner_radius(6).inner_margin(6).show(ui, |ui| {
-                    ui.set_width(search_rect.width() - 12.0);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for l in &self.search_res {
-                        if side_row(ui, &self.store, l, true, "") {
-                            go = Some(l.login.clone());
+            // Escape cierra el dropdown
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                self.search_res.clear();
+            } else {
+                let mut go = None;
+                let dropdown = egui::Area::new(egui::Id::unique("search_res")).order(egui::Order::Foreground).fixed_pos(search_rect.left_bottom() + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).fill(PANEL).corner_radius(6).inner_margin(6).show(ui, |ui| {
+                        ui.set_width(search_rect.width() - 12.0);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for l in &self.search_res {
+                            if side_row(ui, &self.store, l, true, "") {
+                                go = Some(l.login.clone());
+                            }
                         }
-                    }
+                    });
                 });
-            });
-            if let Some(c) = go {
-                self.join(&c);
+                if let Some(c) = go {
+                    self.join(&c);
+                } else if ui.input(|i| i.pointer.any_pressed()) {
+                    let ptr = ui.input(|i| i.pointer.interact_pos().unwrap_or_default());
+                    if !search_rect.contains(ptr) && !dropdown.response.rect.contains(ptr) {
+                        self.search_res.clear();
+                    }
+                }
             }
         }
     }
@@ -1726,12 +1776,10 @@ impl App {
                     self.quality_open = !self.quality_open;
                 }
                 gear = Some(g.rect);
-                if !narrow && icon_btn(b, Icon::Refresh, false, "Recargar el video").clicked() {
-                    self.go_live();
-                }
+                // Skip Ad — pide stream limpio sin ads
                 if self.info.viewers.is_some() {
                     if b.add(egui::Button::new(RichText::new("Skip Ad").font(semi(10.0)).color(Color32::WHITE)).fill(Color32::from_rgb(70, 70, 78)).corner_radius(3)).on_hover_text("Recarga el stream sin anuncios").clicked() {
-                        crate::twitch::load_stream_clean(&self.net, self.chan.clone());
+                        crate::twitch::load_stream_clean(&self.net, self.chan.clone(), self.stream_id);
                     }
                 }
                 if self.ad_detected {
@@ -1910,7 +1958,7 @@ impl App {
             c.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.twitch.tv/{}", self.chan)));
         }
 
-        // Datos: espectadores, tiempo en vivo, retraso al directo y compartir.
+        // Datos y controles discretos debajo del video: recargar y compartir.
         // Ancho: alineados a la derecha como twitch.tv. Angosto: segundo renglón, desde la izquierda.
         let y = if compact { row2 + 17.0 } else { rect.top() + 62.0 };
         let mut items: Vec<(Option<Icon>, String, Color32, FontId, &str)> = Vec::new();
@@ -1935,7 +1983,7 @@ impl App {
         }
         let galleys: Vec<_> = items.iter().map(|(_, t, c, f, _)| p.layout_no_wrap(t.clone(), f.clone(), *c)).collect();
         let widths: Vec<f32> = items.iter().zip(&galleys).map(|(it, g)| g.size().x + if it.0.is_some() { 20.0 } else { 0.0 }).collect();
-        let total: f32 = widths.iter().sum::<f32>() + 16.0 * items.len() as f32 + 26.0;
+        let total: f32 = widths.iter().sum::<f32>() + 16.0 * items.len() as f32 + 60.0;
         let mut x = if compact { rect.left() + 20.0 } else { rect.right() - 16.0 - total };
         for ((it, g), w) in items.iter().zip(galleys).zip(&widths) {
             let tx = if let Some(icon) = it.0 {
@@ -1950,7 +1998,27 @@ impl App {
             }
             x += w + 16.0;
         }
-        let share = Rect::from_min_size(pos2(x, y - 13.0), vec2(26.0, 26.0));
+        let refresh = Rect::from_min_size(pos2(x, y - 13.0), vec2(26.0, 26.0));
+        let pending = self.stream_pending.is_some();
+        let enabled = self.cfg.video && !pending;
+        let attention = self.cfg.video && (pending || !self.status.is_empty()
+            || (!self.paused && !self.rewound && (self.health.needs_attention(Instant::now()) || self.buffer >= 10.0)));
+        let pulse = if attention && ui.style().animation_time > 0.0 {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            ui.input(|i| ((i.time * std::f64::consts::TAU / 1.6).sin() * 0.5 + 0.5) as f32)
+        } else { 0.0 };
+        let accent = Color32::from_rgb((145.0 + 46.0 * pulse) as u8, (71.0 + 77.0 * pulse) as u8, 255);
+        let reload = ui.interact(refresh, egui::Id::unique("refresh_stream"), if enabled { Sense::click() } else { Sense::hover() });
+        if attention {
+            p.rect_filled(refresh.expand(2.0), 6.0, Color32::from_rgba_unmultiplied(191, 148, 255, (60.0 + 80.0 * pulse) as u8));
+        }
+        p.rect_filled(refresh, 4.0, if !self.cfg.video { SIDE } else if enabled && reload.hovered() { PURPLE_L } else { accent });
+        paint_icon(&p, refresh.shrink(5.0), Icon::Refresh, if self.cfg.video { Color32::WHITE } else { DIM });
+        if reload.on_hover_cursor(if enabled { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Default })
+            .on_hover_text(if pending { "Reconectando al directo…" } else if attention { "La reproducción se detuvo o está retrasada. Recargar y volver al directo (F5)" } else { "Recargar el stream y volver al directo (F5)" }).clicked() && enabled {
+            self.go_live();
+        }
+        let share = Rect::from_min_size(pos2(x + 34.0, y - 13.0), vec2(26.0, 26.0));
         let sh = ui.interact(share, egui::Id::unique("share"), Sense::click());
         if sh.hovered() {
             p.rect_filled(share, 4.0, HOVER);
@@ -1962,7 +2030,7 @@ impl App {
         }
     }
 
-    /// "Acerca de" bajo el player, con seguidores y la bio del canal; y "Ver video" si está apagado.
+    /// Zona bajo el player: tabs (Acerca de | Clips | Vídeos) con carga bajo demanda.
     fn about(&mut self, ui: &mut Ui, rect: Rect, gl: Option<&eframe::glow::Context>) {
         let mut c = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
         if !self.cfg.video {
@@ -1975,47 +2043,86 @@ impl App {
         if self.info.name.is_empty() {
             return;
         }
-        // Escondido por defecto: solo el encabezado; clic para ver seguidores y bio.
-        let r = egui::Frame::new().fill(PANEL).corner_radius(6).inner_margin(egui::Margin::symmetric(16, 10)).show(&mut c, |ui| {
-            ui.set_width(rect.width() - 32.0);
+        // Tabs
+        c.horizontal(|ui| {
+            for (label, idx) in [("Acerca de", 0u8), ("Clips", 1), ("Vídeos", 2)] {
+                let sel = self.chan_tab == idx;
+                let color = if sel { PURPLE_L } else { DIM };
+                let r = ui.add(egui::Label::new(RichText::new(label).font(semi(14.0)).color(color)).sense(Sense::click()));
+                if sel {
+                    let p = ui.painter();
+                    p.line_segment([pos2(r.rect.left(), r.rect.bottom() + 2.0), pos2(r.rect.right(), r.rect.bottom() + 2.0)], Stroke::new(2.0, PURPLE_L));
+                }
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !sel {
+                    self.chan_tab = idx;
+                    match idx {
+                        1 if !self.clips_loaded => twitch::load_clips(&self.net, self.chan.clone(), "ALL_TIME"),
+                        2 if !self.videos_loaded => twitch::load_videos(&self.net, self.chan.clone()),
+                        _ => {}
+                    }
+                }
+                ui.add_space(16.0);
+            }
+        });
+        c.add_space(8.0);
+        match self.chan_tab {
+            0 => self.tab_about(&mut c),
+            1 => self.tab_clips(&mut c),
+            2 => self.tab_videos(&mut c),
+            _ => {}
+        }
+    }
+
+    fn tab_about(&mut self, c: &mut Ui) {
+        let w = c.available_width();
+        egui::Frame::new().fill(PANEL).corner_radius(6).inner_margin(egui::Margin::symmetric(16, 10)).show(c, |ui| {
+            ui.set_width(w - 32.0);
             ui.horizontal(|ui| {
-                let (ar, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                paint_icon(ui.painter(), ar.shrink(2.0), if self.about_open { Icon::Left } else { Icon::Right }, DIM);
-                ui.add_space(6.0);
                 ui.label(RichText::new(format!("Acerca de {}", self.info.name)).font(semi(15.0)).color(TEXT));
                 ui.add(egui::Label::new(RichText::new(format!("  ·  {} seguidores", fmt_num(self.info.followers))).color(DIM)).truncate());
             });
-            if self.about_open && !self.info.bio.is_empty() {
+            if !self.info.bio.is_empty() {
                 ui.add_space(6.0);
                 ui.label(RichText::new(&self.info.bio).color(DIM));
             }
+            if !self.info.socials.is_empty() {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (name, title, url) in &self.info.socials {
+                        let label = if title.is_empty() { name } else { title };
+                        if ui.add(egui::Label::new(RichText::new(format!("🔗 {label}")).color(PURPLE_L)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(url).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
+                        ui.add_space(8.0);
+                    }
+                });
+            }
         });
-        // Paneles del canal (como bajo el video en twitch.tv): imagen con enlace, título y texto
-        if self.about_open && !self.info.panels.is_empty() {
+        if !self.info.panels.is_empty() {
             c.add_space(10.0);
             let px = (160.0 * c.ctx().pixels_per_point()).round() as u32;
-            let w = 300.0;
+            let pw = 300.0;
             let mut open = None;
-            egui::ScrollArea::vertical().id_salt("panels").show(&mut c, |ui| {
+            egui::ScrollArea::vertical().id_salt("panels").show(c, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
                     for p in &self.info.panels {
-                        ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
-                            ui.set_width(w);
+                        ui.allocate_ui_with_layout(vec2(pw, 0.0), Layout::top_down(Align::Min), |ui| {
+                            ui.set_width(pw);
                             if !p.title.is_empty() {
                                 ui.label(RichText::new(&p.title).font(semi(15.0)).color(TEXT));
                                 ui.add_space(4.0);
                             }
                             if !p.image.is_empty() {
                                 if let img::Look::Ready(f) = self.store.get(self.store.id(&p.image, px)) {
-                                    let size = vec2(w, w * f.size.y / f.size.x);
+                                    let size = vec2(pw, pw * f.size.y / f.size.x);
                                     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
                                     egui::Image::from_texture(SizedTexture::new(f.tex, size)).uv(f.uv).corner_radius(6.0).paint_at(ui, r);
                                     if !p.link.is_empty() && resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&p.link).clicked() {
                                         open = Some(p.link.clone());
                                     }
                                 } else {
-                                    ui.allocate_exact_size(vec2(w, 100.0), Sense::hover());
+                                    ui.allocate_exact_size(vec2(pw, 100.0), Sense::hover());
                                 }
                                 ui.add_space(4.0);
                             }
@@ -2030,8 +2137,102 @@ impl App {
                 c.ctx().open_url(egui::OpenUrl::new_tab(u));
             }
         }
-        if c.interact(r.response.rect, egui::Id::unique("about_toggle"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            self.about_open = !self.about_open;
+    }
+
+    fn tab_clips(&mut self, c: &mut Ui) {
+        if !self.clips_loaded {
+            c.label(RichText::new("Cargando clips...").color(DIM));
+            return;
+        }
+        if self.clips.is_empty() {
+            c.label(RichText::new("Sin clips").color(DIM));
+            return;
+        }
+        let w = 280.0;
+        let mut open = None;
+        egui::ScrollArea::vertical().id_salt("clips_tab").show(c, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
+                let px = (w * ui.ctx().pixels_per_point()).round() as u32;
+                for clip in &self.clips {
+                    ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(w);
+                        let h = w * 9.0 / 16.0;
+                        if !clip.thumb.is_empty() {
+                            if let img::Look::Ready(f) = self.store.get(self.store.id(&clip.thumb, px)) {
+                                let size = vec2(w, h);
+                                let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+                                egui::Image::from_texture(SizedTexture::new(f.tex, size)).uv(f.uv).corner_radius(6.0).paint_at(ui, r);
+                                // duración
+                                let dur = format!("{}:{:02}", clip.duration / 60, clip.duration % 60);
+                                let dg = ui.painter().layout_no_wrap(dur.clone(), FontId::proportional(11.0), Color32::WHITE);
+                                let dr = Rect::from_min_size(pos2(r.right() - dg.size().x - 12.0, r.bottom() - 22.0), dg.size() + vec2(8.0, 4.0));
+                                ui.painter().rect_filled(dr, 4.0, Color32::from_black_alpha(180));
+                                ui.painter().galley(dr.min + vec2(4.0, 2.0), dg, Color32::WHITE);
+                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    open = Some(format!("https://clips.twitch.tv/{}", clip.slug));
+                                }
+                            } else {
+                                ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                            }
+                        }
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(RichText::new(&clip.title).font(semi(13.0)).color(TEXT)).truncate()).on_hover_text(format!("{}\nClip de {}", clip.title, clip.curator));
+                        ui.label(RichText::new(format!("{} vistas  ·  {}", fmt_num(clip.views), clip.game)).font(FontId::proportional(12.0)).color(DIM));
+                    });
+                }
+            });
+        });
+        if let Some(u) = open {
+            c.ctx().open_url(egui::OpenUrl::new_tab(u));
+        }
+    }
+
+    fn tab_videos(&mut self, c: &mut Ui) {
+        if !self.videos_loaded {
+            c.label(RichText::new("Cargando vídeos...").color(DIM));
+            return;
+        }
+        if self.videos.is_empty() {
+            c.label(RichText::new("Sin vídeos").color(DIM));
+            return;
+        }
+        let w = 280.0;
+        let mut open = None;
+        egui::ScrollArea::vertical().id_salt("vods_tab").show(c, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
+                let px = (w * ui.ctx().pixels_per_point()).round() as u32;
+                for vid in &self.videos {
+                    ui.allocate_ui_with_layout(vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(w);
+                        let h = w * 9.0 / 16.0;
+                        if !vid.thumb.is_empty() {
+                            if let img::Look::Ready(f) = self.store.get(self.store.id(&vid.thumb, px)) {
+                                let size = vec2(w, h);
+                                let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+                                egui::Image::from_texture(SizedTexture::new(f.tex, size)).uv(f.uv).corner_radius(6.0).paint_at(ui, r);
+                                let dur = format!("{}:{:02}:{:02}", vid.length / 3600, vid.length % 3600 / 60, vid.length % 60);
+                                let dg = ui.painter().layout_no_wrap(dur.clone(), FontId::proportional(11.0), Color32::WHITE);
+                                let dr = Rect::from_min_size(pos2(r.right() - dg.size().x - 12.0, r.bottom() - 22.0), dg.size() + vec2(8.0, 4.0));
+                                ui.painter().rect_filled(dr, 4.0, Color32::from_black_alpha(180));
+                                ui.painter().galley(dr.min + vec2(4.0, 2.0), dg, Color32::WHITE);
+                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    open = Some(format!("https://www.twitch.tv/videos/{}", vid.id));
+                                }
+                            } else {
+                                ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                            }
+                        }
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(RichText::new(&vid.title).font(semi(13.0)).color(TEXT)).truncate()).on_hover_text(format!("{}\n{}", vid.title, vid.date));
+                        ui.label(RichText::new(format!("{} vistas  ·  {}", fmt_num(vid.views), vid.game)).font(FontId::proportional(12.0)).color(DIM));
+                    });
+                }
+            });
+        });
+        if let Some(u) = open {
+            c.ctx().open_url(egui::OpenUrl::new_tab(u));
         }
     }
 
