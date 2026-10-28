@@ -1,8 +1,11 @@
-param([switch]$SkipBaseline, [string]$LogPath = (Join-Path $env:APPDATA 'TwitchLite\twitchlite.log'))
+param([switch]$SkipBaseline, [string]$LogPath = (Join-Path $env:APPDATA 'TwitchLite\twitchlite.log'), [switch]$FunctionsOnly)
 $ErrorActionPreference = 'Stop'
 
 function Invoke-Mpv([object[]]$Command) {
-    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', 'twitchlite-qa', [System.IO.Pipes.PipeDirection]::InOut)
+    $pipeName = 'twitchlite-qa'
+    $active = Select-String -LiteralPath $LogPath -Pattern 'Player IPC: ' | Select-Object -Last 1
+    if ($active) { $pipeName = ($active.Line -split 'Player IPC: ', 2)[1] -replace '^\\\\\.\\pipe\\', '' }
+    $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
     try {
         $pipe.Connect(3000)
         $writer = [System.IO.StreamWriter]::new($pipe)
@@ -33,6 +36,8 @@ function Get-MpvPosition {
     }
     throw 'No apareció la posición después de reconectar'
 }
+
+if ($FunctionsOnly) { return }
 
 if (!$SkipBaseline) {
     $baselineCount = Refresh-Count

@@ -161,6 +161,11 @@ pub struct Irc {
     pub text: String,
 }
 
+pub struct StreamCandidate {
+    pub qualities: Vec<(String, String)>,
+    pub selected: (String, String),
+}
+
 pub enum Ev {
     Line(u64, Irc),
     Status(u64, String),
@@ -188,7 +193,7 @@ pub enum Ev {
     Clips(String, Vec<Clip>),
     Videos(String, Vec<Video>),
     AdStatus(u64, bool),
-    CleanStream(String, u64, Result<Vec<(String, String)>, String>),
+    CleanStream(String, u64, u64, Result<StreamCandidate, String>),
 }
 
 // ---------- Secretos: Administrador de credenciales de Windows / Llavero de macOS ----------
@@ -861,11 +866,24 @@ pub fn device_login(net: &Net, cid: String) {
 /// o tienes Turbo, Twitch no mete anuncios (igual que en la web).
 pub fn load_stream(net: &Net, chan: String, session: Option<String>, request: u64) {
     net.spawn(move |net| {
+        let res = stream_qualities(&chan, session.as_deref(), "site");
+        net.send(Ev::Stream(chan, request, res));
+    });
+}
+
+fn playback_agent() -> &'static ureq::Agent {
+    static A: OnceLock<ureq::Agent> = OnceLock::new();
+    A.get_or_init(|| ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(5))).build().into())
+}
+
+fn stream_qualities(chan: &str, session: Option<&str>, player_type: &str) -> Result<Vec<(String, String)>, String> {
         let q = "query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }";
         let body = json!({"operationName": "PlaybackAccessToken_Template", "query": q,
-            "variables": {"isLive": true, "login": chan, "isVod": false, "vodID": "", "playerType": "site"}});
-        let res = (|| {
-            let v = gql_as(&body, session.as_deref()).ok_or("Sin respuesta de Twitch")?;
+            "variables": {"isLive": true, "login": chan, "isVod": false, "vodID": "", "playerType": player_type}});
+            let mut req = playback_agent().post("https://gql.twitch.tv/gql").header("Client-Id", WEB_CLIENT_ID).header("Content-Type", "application/json");
+            if let Some(token) = session { req = req.header("Authorization", &format!("OAuth {token}")); }
+            let raw = req.send(body.to_string()).map_err(|_| "Sin respuesta de Twitch")?.body_mut().read_to_string().map_err(|_| "Respuesta de Twitch incompleta")?;
+            let v: Value = serde_json::from_str(&raw).map_err(|_| "Respuesta de Twitch inválida")?;
             let t = &v["data"]["streamPlaybackAccessToken"];
             if t.is_null() {
                 return Err("Canal no encontrado".to_string());
@@ -874,13 +892,10 @@ pub fn load_stream(net: &Net, chan: String, session: Option<String>, request: u6
                 "https://usher.ttvnw.net/api/channel/hls/{chan}.m3u8?allow_source=true&allow_audio_only=true&fast_bread=true&p={}&sig={}&token={}",
                 rnd() % 999_999, s(&t["signature"]), enc(&s(&t["value"]))
             );
-            let m3u8 = agent().get(&url).call().map_err(|_| "Offline".to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
+            let m3u8 = playback_agent().get(&url).call().map_err(|_| "Canal desconectado o playlist no disponible".to_string())?.body_mut().read_to_string().map_err(|_| "Playlist incompleta".to_string())?;
             let qualities = parse_master(&m3u8);
             if qualities.is_empty() { return Err("Twitch devolvió una playlist vacía".to_string()); }
             Ok(qualities)
-        })();
-        net.send(Ev::Stream(chan, request, res));
-    });
 }
 
 /// Al soltarlo se cancela el monitor anterior, incluso si nunca volvió a cambiar el anuncio.
@@ -889,9 +904,12 @@ pub struct AdMonitor { _cancel: Sender<()> }
 pub fn start_ad_monitor(net: &Net, variant_url: String, request: u64, mut was_ad: bool) -> AdMonitor {
     let (cancel, stop) = channel();
     net.spawn(move |net| {
+        let mut first = true;
         loop {
             // Desconectar el sender despierta inmediatamente este hilo al cambiar de canal/URL.
-            if !matches!(stop.recv_timeout(Duration::from_secs(3)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { return; }
+            let delay = if first { Duration::ZERO } else { Duration::from_secs(2) };
+            first = false;
+            if !matches!(stop.recv_timeout(delay), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { return; }
             let body = match agent().get(&variant_url).call().and_then(|mut r| Ok(r.body_mut().read_to_string()?)) {
                 Ok(b) => b,
                 Err(e) => {
@@ -912,28 +930,94 @@ pub fn start_ad_monitor(net: &Net, variant_url: String, request: u64, mut was_ad
 }
 
 fn playlist_has_ad(body: &str) -> bool {
-    body.lines().filter_map(|l| l.strip_prefix("#EXT-X-DATERANGE:"))
-        .any(|l| l.split(',').any(|a| a.trim_start().starts_with("CLASS=\"") && a.contains("stitched-ad")))
+    let mut clock = None;
+    let mut duration = None;
+    let mut latest = None;
+    let mut latest_end = None;
+    let mut title_is_ad = false;
+    let mut next_title_ad = false;
+    for line in body.lines() {
+        if let Some(date) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            clock = hls_time(date);
+        } else if let Some(info) = line.strip_prefix("#EXTINF:") {
+            let (seconds, title) = info.split_once(',').unwrap_or((info, ""));
+            duration = seconds.parse::<f64>().ok();
+            next_title_ad = title.contains("Amazon");
+        } else if !line.starts_with('#') && !line.trim().is_empty() && duration.is_some() {
+            latest = clock;
+            latest_end = clock.zip(duration).map(|(a, b)| a + b);
+            clock = latest_end;
+            title_is_ad = next_title_ad;
+            duration = None;
+        }
+    }
+    title_is_ad || body.lines().filter_map(|l| l.strip_prefix("#EXT-X-DATERANGE:")).any(|attrs| {
+        let ad = hls_attr(attrs, "CLASS") == Some("twitch-stitched-ad")
+            || hls_attr(attrs, "ID").is_some_and(|id| id.starts_with("stitched-ad-"));
+        if !ad { return false; }
+        let start = hls_attr(attrs, "START-DATE").and_then(hls_time);
+        let end = hls_attr(attrs, "END-DATE").and_then(hls_time).or_else(|| {
+            start.zip(hls_attr(attrs, "DURATION").and_then(|n| n.parse::<f64>().ok())).map(|(a, b)| a + b)
+        });
+        match (latest, start, end) {
+            (Some(t), Some(s), e) => (t >= s && e.is_none_or(|e| t < e))
+                || latest_end.is_some_and(|edge| s >= edge && s - edge <= 4.0),
+            (Some(t), None, Some(e)) => t < e,
+            _ => true, // Sin reloj no se declara limpia una variante con marcadores de publicidad.
+        }
+    })
+}
+
+fn hls_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let (mut quoted, mut start) = (false, 0);
+    for (i, byte) in attrs.bytes().chain(Some(b',')).enumerate() {
+        if byte == b'"' { quoted = !quoted; }
+        if byte == b',' && !quoted {
+            if let Some((name, value)) = attrs[start..i].trim().split_once('=') {
+                if name == key { return Some(value.trim_matches('"')); }
+            }
+            start = i + 1;
+        }
+    }
+    None
+}
+
+fn hls_time(t: &str) -> Option<f64> {
+    let mut epoch = parse_iso(t)? as f64;
+    let tail = t.get(19..)?;
+    if let Some(fraction) = tail.strip_prefix('.') {
+        let digits: String = fraction.chars().take_while(|c| c.is_ascii_digit()).collect();
+        epoch += format!("0.{digits}").parse::<f64>().ok()?;
+    }
+    if let Some(i) = tail.find(['+', '-']) {
+        let zone = &tail[i..];
+        let offset = zone.get(1..3)?.parse::<f64>().ok()? * 3600.0 + zone.get(4..6)?.parse::<f64>().ok()? * 60.0;
+        epoch -= if zone.starts_with('+') { offset } else { -offset };
+    }
+    Some(epoch)
+}
+
+fn validate_alternative(body: &str) -> Result<(), String> {
+    if !body.trim_start().starts_with("#EXTM3U") || !body.lines().any(|l| l.starts_with("#EXTINF:")) || body.contains("#EXT-X-ENDLIST") {
+        return Err("La variante alternativa no contiene un directo activo".into());
+    }
+    if playlist_has_ad(body) { return Err("La variante alternativa todavía contiene publicidad".into()); }
+    Ok(())
 }
 
 /// pide un stream anónimo (playerType "embed") para reemplazar al principal cuando hay ad.
-pub fn load_stream_clean(net: &Net, chan: String, request: u64) {
+pub fn load_stream_clean(net: &Net, chan: String, request: u64, attempt: u64, preferred: String, height: u32) {
     net.spawn(move |net| {
-        let q = "query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }";
-        let body = json!({"operationName": "PlaybackAccessToken_Template", "query": q,
-            "variables": {"isLive": true, "login": chan, "isVod": false, "vodID": "", "playerType": "embed"}});
         let res = (|| {
-            let v = gql_as(&body, None).ok_or("Sin respuesta de Twitch")?;
-            let t = &v["data"]["streamPlaybackAccessToken"];
-            if t.is_null() { return Err("Canal no encontrado".to_string()); }
-            let url = format!(
-                "https://usher.ttvnw.net/api/channel/hls/{chan}.m3u8?allow_source=true&allow_audio_only=true&fast_bread=true&p={}&sig={}&token={}",
-                rnd() % 999_999, s(&t["signature"]), enc(&s(&t["value"]))
-            );
-            let m3u8 = agent().get(&url).call().map_err(|_| "Offline".to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
-            Ok(parse_master(&m3u8))
+            let qualities = stream_qualities(&chan, None, "embed")?;
+            let selected = qualities.iter().find(|q| q.0 == preferred).or_else(|| crate::auto_pick(&qualities, height)).or(qualities.first())
+                .cloned().ok_or("Twitch no devolvió una variante alternativa")?;
+            let media = playback_agent().get(&selected.1).call().map_err(|_| "La variante alternativa no respondió")?
+                .body_mut().read_to_string().map_err(|_| "Playlist alternativa incompleta")?;
+            validate_alternative(&media)?;
+            Ok(StreamCandidate { qualities, selected })
         })();
-        net.send(Ev::CleanStream(chan, request, res));
+        net.send(Ev::CleanStream(chan, request, attempt, res));
     });
 }
 
@@ -1062,6 +1146,35 @@ fn session(net: &Net, generation: u64, chan: &str, auth: Option<&Auth>, rx: &Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_ad_metadata_does_not_mark_live_segments_as_ads() {
+        let marker = "#EXTM3U\n#EXT-X-DATERANGE:ID=\"stitched-ad-1\",CLASS=\"twitch-stitched-ad\",START-DATE=\"2026-10-28T12:00:00.000Z\",DURATION=30.0\n";
+        let media = format!("{marker}#EXT-X-PROGRAM-DATE-TIME:2026-10-28T12:01:00.000Z\n#EXTINF:2.0,live\nsegment.ts\n");
+        assert!(!playlist_has_ad(&media));
+        assert!(validate_alternative(&media).is_ok());
+        let active = media.replace("12:01:00.000Z", "12:00:20.000Z");
+        assert!(playlist_has_ad(&active));
+        assert!(validate_alternative(&active).is_err());
+    }
+
+    #[test]
+    fn upcoming_ads_and_ad_segment_titles_are_rejected_before_handoff() {
+        let media = "#EXTM3U\n#EXT-X-DATERANGE:CLASS=\"twitch-stitched-ad\",START-DATE=\"2026-10-28T12:00:02Z\",DURATION=30\n#EXT-X-PROGRAM-DATE-TIME:2026-10-28T12:00:00Z\n#EXTINF:2,live\nsegment.ts\n";
+        assert!(playlist_has_ad(media));
+        assert!(validate_alternative(media).is_err());
+        assert!(playlist_has_ad("#EXTM3U\n#EXTINF:2,Amazon\nad.ts\n"));
+        assert!(!playlist_has_ad("#EXTM3U\n#EXTINF:2,Amazon\nad.ts\n#EXTINF:2,live\nlive.ts\n"));
+        assert!(validate_alternative("#EXTM3U\n").is_err());
+        assert!(validate_alternative("#EXTM3U\n#EXTINF:2,live\na.ts\n#EXT-X-ENDLIST\n").is_err());
+    }
+
+    #[test]
+    fn hls_attributes_and_clock_handle_quoted_commas_fractions_and_offsets() {
+        assert_eq!(hls_attr("ID=\"a,b\",CLASS=\"twitch-stitched-ad\",DURATION=30", "CLASS"), Some("twitch-stitched-ad"));
+        assert_eq!(hls_time("2026-10-28T06:00:00.500-06:00"), hls_time("2026-10-28T12:00:00.500Z"));
+        assert_eq!(hls_time("1970-01-01T00:00:00.250Z"), Some(0.25));
+    }
 
     #[test]
     fn ad_markers_require_a_daterange_class() {

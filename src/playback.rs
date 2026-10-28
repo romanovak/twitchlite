@@ -1,5 +1,52 @@
 use std::time::{Duration, Instant};
 
+/// Una sola búsqueda/preparación a la vez; los fallos no disparan un bucle de recargas.
+#[derive(Default)]
+pub struct AdRecovery {
+    pending: Option<Instant>,
+    retry_at: Option<Instant>,
+    failures: u32,
+}
+
+impl AdRecovery {
+    pub fn begin(&mut self, now: Instant, force: bool) -> bool {
+        if self.pending.is_some() || (!force && self.retry_at.is_some_and(|t| now < t)) { return false; }
+        self.pending = Some(now);
+        true
+    }
+
+    pub fn pending(&self) -> bool { self.pending.is_some() }
+    pub fn expired(&self, now: Instant) -> bool {
+        self.pending.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(20))
+    }
+
+    pub fn failed(&mut self, now: Instant) {
+        self.pending = None;
+        self.retry_at = Some(now + Duration::from_secs((2u64 << self.failures.min(3)).min(15)));
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    pub fn cancel(&mut self) { self.pending = None; }
+}
+
+pub struct Warmup {
+    started: Instant,
+    first_position: Option<f64>,
+    first_frame: Option<f64>,
+}
+
+impl Warmup {
+    pub fn new(now: Instant) -> Self { Self { started: now, first_position: None, first_frame: None } }
+
+    pub fn ready(&mut self, pos: Option<f64>, frames: Option<f64>, video: bool, buffering: bool) -> bool {
+        let moving = pos.is_some_and(|p| p - *self.first_position.get_or_insert(p) >= 0.2);
+        let drawn = frames.is_some_and(|f| f - *self.first_frame.get_or_insert(f) >= 1.0);
+        moving && (!video || drawn) && !buffering
+    }
+
+    pub fn expired(&self, now: Instant) -> bool { now.duration_since(self.started) >= Duration::from_secs(8) }
+}
+
 /// Se consulta con un reloj independiente del render: también detecta un mpv sin callbacks.
 pub struct Health {
     started: Instant,
@@ -95,6 +142,39 @@ impl Health {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternate_requests_are_serialized_and_back_off() {
+        let mut t = Instant::now();
+        let mut r = AdRecovery::default();
+        for delay in [2, 4, 8, 15, 15] {
+            assert!(r.begin(t, false));
+            assert!(!r.begin(t, true));
+            assert!(!r.expired(t + Duration::from_secs(19)));
+            assert!(r.expired(t + Duration::from_secs(20)));
+            r.failed(t);
+            assert!(!r.begin(t + Duration::from_secs(delay - 1), false));
+            t += Duration::from_secs(delay);
+        }
+        assert!(r.begin(t, false));
+        r.cancel();
+        assert!(!r.pending());
+    }
+
+    #[test]
+    fn handoff_needs_moving_video_and_never_promotes_a_frozen_candidate() {
+        let t = Instant::now();
+        let mut w = Warmup::new(t);
+        assert!(!w.ready(None, None, true, false));
+        assert!(!w.ready(Some(0.0), Some(1.0), true, false));
+        assert!(!w.ready(Some(1.0), Some(1.0), true, false));
+        assert!(!w.ready(Some(1.1), Some(2.0), true, true));
+        assert!(w.ready(Some(1.2), Some(3.0), true, false));
+        assert!(w.expired(t + Duration::from_secs(8)));
+        let mut audio = Warmup::new(t);
+        assert!(!audio.ready(Some(0.0), None, false, false));
+        assert!(audio.ready(Some(0.3), None, false, false));
+    }
 
     #[test]
     fn frozen_video_is_detected_even_when_audio_advances() {

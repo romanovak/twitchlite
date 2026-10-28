@@ -792,6 +792,7 @@ fn tabs(ui: &mut Ui, labels: &[&str], sel: &mut u8) -> bool {
 impl App {
     pub fn draw(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let gl = frame.gl().cloned();
+        if let Some(gl) = &gl { self.prepare_handoff(gl, frame); }
         let on_chan = self.page == Page::Channel && !self.chan.is_empty();
         let fullscreen = ui.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1637,6 +1638,47 @@ impl App {
         }
     }
 
+    fn prepare_handoff(&mut self, gl: &eframe::glow::Context, frame: &mut eframe::Frame) {
+        for p in self.retired_players.drain(..) { p.destroy(gl); }
+        if self.handoff.is_none() { return; }
+        if self.paused || self.rewound || !self.cfg.video { self.cancel_handoff(); return; }
+        if self.ad_player.is_none() {
+            let player = self.get_proc.clone().ok_or_else(|| "Sin contexto OpenGL".to_string())
+                .and_then(|gp| crate::mpv::Player::standby(gp, self.net.ctx.clone(), self.cfg.volume));
+            match player {
+                Ok(p) => {
+                    p.play(&self.handoff.as_ref().unwrap().candidate.selected.1);
+                    self.ad_player = Some(p);
+                    crate::tlog("Alternative warmup: muted player created");
+                }
+                Err(e) => {
+                    self.cancel_handoff();
+                    self.ad_recovery.failed(Instant::now());
+                    crate::tlog(&format!("Alternative warmup failed: {e}"));
+                    return;
+                }
+            }
+        }
+        let p = self.ad_player.as_mut().unwrap();
+        p.texture(gl, frame, [2, 2]);
+        let handoff = self.handoff.as_mut().unwrap();
+        let ready = handoff.warmup.ready(p.num("time-pos"), p.frame_serial(), handoff.candidate.selected.0 != "audio_only", p.flag("paused-for-cache") || p.flag("idle-active"));
+        if ready {
+            crate::tlog(&format!("Alternative ready: frames={:.0}, position={:.3}", p.frame_serial().unwrap_or(0.0), p.num("time-pos").unwrap_or(0.0)));
+            let candidate = self.handoff.take().unwrap().candidate;
+            let next = self.ad_player.take().unwrap();
+            if let Some(old) = self.player.replace(next) {
+                old.set("mute", "yes");
+                old.destroy(gl);
+            }
+            self.accept_alternative(candidate);
+        } else if handoff.warmup.expired(Instant::now()) {
+            self.cancel_handoff();
+            self.ad_recovery.failed(Instant::now());
+            crate::tlog("Alternative warmup failed: no moving frames; current playback preserved");
+        }
+    }
+
     fn player(&mut self, ui: &mut Ui, frame: &mut eframe::Frame, rect: Rect) {
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
         let resp = ui.interact(rect, egui::Id::unique("video"), Sense::click());
@@ -1776,10 +1818,9 @@ impl App {
                     self.quality_open = !self.quality_open;
                 }
                 gear = Some(g.rect);
-                // Skip Ad — pide stream limpio sin ads
                 if self.info.viewers.is_some() {
-                    if b.add(egui::Button::new(RichText::new("Skip Ad").font(semi(10.0)).color(Color32::WHITE)).fill(Color32::from_rgb(70, 70, 78)).corner_radius(3)).on_hover_text("Recarga el stream sin anuncios").clicked() {
-                        crate::twitch::load_stream_clean(&self.net, self.chan.clone(), self.stream_id);
+                    if b.add_enabled(!self.ad_recovery.pending(), egui::Button::new(RichText::new("Skip Ad").font(semi(10.0)).color(Color32::WHITE)).fill(Color32::from_rgb(70, 70, 78)).corner_radius(3)).on_hover_text("Buscar una variante sin publicidad. Se intenta automáticamente al detectar un anuncio.").clicked() {
+                        self.request_ad_skip(true);
                     }
                 }
                 if self.ad_detected {
@@ -2001,7 +2042,7 @@ impl App {
         let refresh = Rect::from_min_size(pos2(x, y - 13.0), vec2(26.0, 26.0));
         let pending = self.stream_pending.is_some();
         let enabled = self.cfg.video && !pending;
-        let attention = self.cfg.video && (pending || !self.status.is_empty()
+        let attention = self.cfg.video && (pending || self.ad_recovery.pending() || !self.status.is_empty()
             || (!self.paused && !self.rewound && (self.health.needs_attention(Instant::now()) || self.buffer >= 10.0)));
         let pulse = if attention && ui.style().animation_time > 0.0 {
             ui.ctx().request_repaint_after(Duration::from_millis(100));

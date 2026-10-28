@@ -4,7 +4,7 @@ use eframe::egui;
 use eframe::glow::{self, HasContext};
 use libloading::Library;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub type GetProc = Arc<dyn Fn(&CStr) -> *const c_void + Send + Sync>;
 
@@ -52,49 +52,55 @@ unsafe extern "C" fn wake(ctx: *mut c_void) {
 }
 
 pub struct Player {
-    api: Api,
+    api: Arc<Api>,
     h: H,
     rc: H,
     _gp: Box<GetProc>,
     _ctx: Box<egui::Context>,
     target: Option<(glow::Framebuffer, glow::Texture, egui::TextureId, [i32; 2])>,
     frame_serial: u64,
+    ipc_name: Option<String>,
 }
 
 fn cs(s: &str) -> CString {
     CString::new(s).unwrap_or_default()
 }
 
-impl Player {
-    pub fn new(gp: GetProc, ctx: egui::Context, volume: f32) -> Result<Self, String> {
+fn shared_api() -> Result<Arc<Api>, String> {
+    static API: OnceLock<Result<Arc<Api>, String>> = OnceLock::new();
+    API.get_or_init(|| {
         let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default();
         let names = if cfg!(windows) { ["libmpv-2.dll", "mpv-2.dll"] } else { ["libmpv.dylib", "libmpv.2.dylib"] };
-        let lib = names
-            .iter()
-            .find_map(|n| unsafe { Library::new(dir.join(n)).or_else(|_| Library::new(*n)) }.ok())
+        let lib = names.iter().find_map(|n| unsafe { Library::new(dir.join(n)).or_else(|_| Library::new(*n)) }.ok())
             .ok_or("Falta libmpv-2.dll junto al .exe")?;
         unsafe {
             macro_rules! sym {
-                ($n:literal) => {
-                    *lib.get(concat!($n, "\0").as_bytes()).map_err(|e| e.to_string())?
-                };
+                ($n:literal) => { *lib.get(concat!($n, "\0").as_bytes()).map_err(|e| e.to_string())? };
             }
-            let api = Api {
-                create: sym!("mpv_create"),
-                initialize: sym!("mpv_initialize"),
-                set_option: sym!("mpv_set_option_string"),
-                set_property: sym!("mpv_set_property_string"),
-                get_property: sym!("mpv_get_property"),
-                free: sym!("mpv_free"),
-                command: sym!("mpv_command"),
-                destroy: sym!("mpv_terminate_destroy"),
-                rc_create: sym!("mpv_render_context_create"),
-                rc_callback: sym!("mpv_render_context_set_update_callback"),
-                rc_update: sym!("mpv_render_context_update"),
-                rc_render: sym!("mpv_render_context_render"),
-                rc_free: sym!("mpv_render_context_free"),
-                _lib: lib,
-            };
+            Ok(Arc::new(Api {
+                create: sym!("mpv_create"), initialize: sym!("mpv_initialize"),
+                set_option: sym!("mpv_set_option_string"), set_property: sym!("mpv_set_property_string"),
+                get_property: sym!("mpv_get_property"), free: sym!("mpv_free"), command: sym!("mpv_command"),
+                destroy: sym!("mpv_terminate_destroy"), rc_create: sym!("mpv_render_context_create"),
+                rc_callback: sym!("mpv_render_context_set_update_callback"), rc_update: sym!("mpv_render_context_update"),
+                rc_render: sym!("mpv_render_context_render"), rc_free: sym!("mpv_render_context_free"), _lib: lib,
+            }))
+        }
+    }).clone()
+}
+
+impl Player {
+    pub fn new(gp: GetProc, ctx: egui::Context, volume: f32) -> Result<Self, String> {
+        Self::create(gp, ctx, volume, false)
+    }
+
+    pub fn standby(gp: GetProc, ctx: egui::Context, volume: f32) -> Result<Self, String> {
+        Self::create(gp, ctx, volume, true)
+    }
+
+    fn create(gp: GetProc, ctx: egui::Context, volume: f32, standby: bool) -> Result<Self, String> {
+        let api = shared_api()?;
+        unsafe {
             let h = (api.create)();
             if h.is_null() {
                 return Err("mpv_create falló".into());
@@ -122,14 +128,20 @@ impl Player {
                 ("force-seekable", "yes"),
                 ("audio-client-name", "Twitch Lite"),
                 ("volume", vol.as_str()),
+                ("mute", if standby { "yes" } else { "no" }),
             ] {
                 (api.set_option)(h, cs(k).as_ptr(), cs(v).as_ptr());
             }
             if let Ok(log) = std::env::var("TWITCHLITE_MPV_LOG") {
+                let log = if standby { format!("{log}.standby") } else { log };
                 (api.set_option)(h, cs("log-file").as_ptr(), cs(&log).as_ptr());
             }
             // Diagnóstico local opt-in para probar cortes con la DLL real, sin exponer IPC por defecto.
-            if let Ok(pipe) = std::env::var("TWITCHLITE_MPV_IPC") {
+            let ipc_name = std::env::var("TWITCHLITE_MPV_IPC").ok().map(|pipe| {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                if standby { format!("{pipe}-standby-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) } else { pipe }
+            });
+            if let Some(pipe) = &ipc_name {
                 (api.set_option)(h, cs("input-ipc-server").as_ptr(), cs(&pipe).as_ptr());
             }
             if (api.initialize)(h) < 0 {
@@ -151,7 +163,7 @@ impl Player {
                 return Err("mpv no pudo crear el contexto OpenGL".into());
             }
             (api.rc_callback)(rc, wake, &*ctx as *const egui::Context as *mut c_void);
-            Ok(Self { api, h, rc, _gp: gp, _ctx: ctx, target: None, frame_serial: 0 })
+            Ok(Self { api, h, rc, _gp: gp, _ctx: ctx, target: None, frame_serial: 0, ipc_name })
         }
     }
 
@@ -205,6 +217,7 @@ impl Player {
     pub fn frame_serial(&self) -> Option<f64> {
         (self.frame_serial > 0).then_some(self.frame_serial as f64)
     }
+    pub fn ipc_name(&self) -> Option<&str> { self.ipc_name.as_deref() }
     /// Relación de aspecto del video actual (16:9 si aún no hay frame).
     pub fn aspect(&self) -> f32 {
         let (w, h) = (self.int("dwidth"), self.int("dheight"));
@@ -255,11 +268,13 @@ impl Player {
     pub fn destroy(mut self, gl: &glow::Context) {
         unsafe {
             (self.api.rc_free)(self.rc);
-            (self.api.destroy)(self.h);
             if let Some((fb, tex, ..)) = self.target.take() {
                 gl.delete_framebuffer(fb);
                 gl.delete_texture(tex);
             }
         }
+        // El cierre de una conexión HLS puede esperar al timeout de red. No bloquea la UI.
+        let (api, handle) = (self.api.clone(), self.h as usize);
+        std::thread::spawn(move || unsafe { (api.destroy)(handle as H); });
     }
 }

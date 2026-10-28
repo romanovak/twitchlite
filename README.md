@@ -25,7 +25,7 @@ Built with Rust, egui/eframe (OpenGL), and libmpv for video playback.
 
 ## Quick Start
 
-Download `twitchlite-portable.zip` from [Releases](https://github.com/romanovak/twitchlite/releases/latest), extract, and double-click `twitchlite.exe`. Everything is included.
+Download `TwitchLite-Portable-Windows.zip` from [TwitchLite Portable Windows](https://github.com/romanovak/twitchlite/releases/latest), extract, and double-click `twitchlite.exe`. Everything is included.
 
 If you run only the exe without the DLL, it will auto-download `libmpv-2.dll` on first launch. Without libmpv the app still works in chat-only mode.
 
@@ -67,7 +67,7 @@ Config is saved at `%APPDATA%\TwitchLite\config.json`. Diagnostic logs are in `%
 
 The purple refresh icon sits next to Share in the channel information below the video. It pulses when playback stops advancing, a retry is pending, or the player falls far behind live. It remains steady during normal playback. Hover for the tooltip, or press F5 to renew the playback session and return to live.
 
-The player retries freezes automatically and reconnects when an ad break ends. Manual pause and rewind are respected. Network failures use increasing retry delays. Recovery depends on Twitch and the network; an uninterrupted stream or an ad-free alternative is not guaranteed.
+When the active video playlist signals an ad, the app automatically requests a fresh alternative. It checks the newest HLS segments for advertising and preloads the candidate in a muted second player. It switches only after that player has drawn moving frames, then replaces the quality list and playlist monitor together. A rejected or stalled candidate leaves the current player intact and uses increasing retry delays. Manual pause and rewind are respected. Twitch must supply live content for the alternative; an uninterrupted stream or an ad-free alternative is not guaranteed.
 
 ### Validation
 
@@ -87,6 +87,8 @@ Remove-Item Env:TWITCHLITE_MPV_IPC
 ```
 
 The helper deliberately pauses mpv, verifies that the app reconnects without a manual refresh, and checks that playback advances afterward. Close and reopen the app normally after the check; IPC is disabled unless the environment variable is set. Verbose mpv logging is opt-in through `TWITCHLITE_MPV_LOG`; keep those logs private because playback URLs can contain session tokens.
+
+For ad handoff integration tests, `TWITCHLITE_TEST_AD_PLAYLIST` can point the monitor at a loopback HTTP fixture. This override is accepted only for `http://127.0.0.1:` while diagnostic IPC is enabled. The actual alternative playback still uses Twitch; a simulated marker does not prove that Twitch will supply an alternative during every real ad break.
 
 ## Architecture
 

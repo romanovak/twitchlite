@@ -11,33 +11,77 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
+      - name: Preserve an already published portable release
+        id: published
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $exists = $false
+          try {
+            $tag = [Uri]::EscapeDataString($env:RELEASE_TAG)
+            $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:RELEASE_REPO/releases/tags/$tag" -Headers $headers
+            $names = @($release.assets.name)
+            $exists = !$release.draft -and ($names -contains 'TwitchLite-Portable-Windows.zip') -and ($names -contains 'libmpv-2.dll') -and ($names -contains 'SHA256SUMS.txt')
+          } catch {
+            if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+          }
+          "exists=$($exists.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - uses: actions/checkout@v4
+        if: steps.published.outputs.exists != 'true'
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.published.outputs.exists != 'true'
 
-      - name: Build release
-        run: cargo build --release
-
-      - name: Download libmpv
-        shell: pwsh
+      - name: Test and build
+        if: steps.published.outputs.exists != 'true'
         run: |
-          $mpvUrl = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20250504-git-20816df.7z/download"
-          Invoke-WebRequest -Uri $mpvUrl -OutFile mpv-dev.7z -MaximumRetryCount 3
-          7z x mpv-dev.7z -ompv-dev
-          Copy-Item mpv-dev/libmpv-2.dll -Destination .
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked
+
+      - name: Download the verified video runtime
+        if: steps.published.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          $base = "https://github.com/$env:RELEASE_REPO/releases/latest/download"
+          Invoke-WebRequest -Uri "$base/libmpv-2.dll" -OutFile libmpv-2.dll -MaximumRetryCount 3
+          $checks = (Invoke-WebRequest -Uri "$base/SHA256SUMS.txt").Content
+          if ($checks -is [byte[]]) { $checks = [Text.Encoding]::UTF8.GetString($checks) }
+          $entry = $checks -split '\r?\n' | Where-Object { $_ -match '^[a-fA-F0-9]{64}\s+libmpv-2\.dll$' } | Select-Object -First 1
+          if (!$entry) { throw 'The video runtime checksum is missing' }
+          $expected = ($entry -split '\s+')[0]
+          if ((Get-FileHash libmpv-2.dll).Hash -ne $expected) { throw 'The video runtime checksum does not match' }
 
       - name: Package
+        if: steps.published.outputs.exists != 'true'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path release -Force
+          New-Item -ItemType Directory -Path release -Force | Out-Null
           Copy-Item target/release/twitchlite.exe -Destination release/
           Copy-Item libmpv-2.dll -Destination release/
-          Compress-Archive -Path release/* -DestinationPath twitchlite-portable.zip
+          Copy-Item README.md -Destination release/README.md
+          Copy-Item LICENSE -Destination release/LICENSE.txt
+          Compress-Archive -Path release/* -DestinationPath TwitchLite-Portable-Windows.zip
+          $checks = @('TwitchLite-Portable-Windows.zip', 'release/twitchlite.exe', 'release/libmpv-2.dll') | ForEach-Object {
+            $hash = Get-FileHash -LiteralPath $_
+            '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $_)
+          }
+          $checks | Set-Content -Path SHA256SUMS.txt -Encoding utf8
 
-      - name: Create GitHub Release
+      - name: Publish TwitchLite Portable Windows
+        if: steps.published.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
+          name: TwitchLite Portable Windows
           files: |
-            twitchlite-portable.zip
+            TwitchLite-Portable-Windows.zip
             release/twitchlite.exe
             release/libmpv-2.dll
+            SHA256SUMS.txt

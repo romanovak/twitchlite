@@ -360,6 +360,11 @@ fn hhmm(ms: i64, tz: i64) -> String {
 
 // ---------- App ----------
 
+struct Handoff {
+    candidate: twitch::StreamCandidate,
+    warmup: playback::Warmup,
+}
+
 struct App {
     net: Net,
     rx: Receiver<Ev>,
@@ -470,8 +475,11 @@ struct App {
     health_t: Instant,
     ad_monitor: Option<twitch::AdMonitor>,
     ad_detected: bool, // anuncio detectado en el HLS
-    ad_player: Option<mpv::Player>, // segundo player para el anuncio en PiP
-    ad_muted: bool,
+    ad_player: Option<mpv::Player>, // precarga silenciada, solo durante el cambio de variante
+    ad_recovery: playback::AdRecovery,
+    ad_attempt: u64,
+    handoff: Option<Handoff>,
+    retired_players: Vec<mpv::Player>,
 }
 
 impl App {
@@ -599,7 +607,10 @@ impl App {
             ad_monitor: None,
             ad_detected: false,
             ad_player: None,
-            ad_muted: true,
+            ad_recovery: playback::AdRecovery::default(),
+            ad_attempt: 0,
+            handoff: None,
+            retired_players: Vec::new(),
             cfg,
         };
         dwm_style(app.hwnd);
@@ -639,8 +650,8 @@ impl App {
             self.stream_id = self.stream_id.wrapping_add(1);
             self.stream_pending = None;
             self.health = playback::Health::new(Instant::now());
-            self.ad_player = None;
-            self.ad_muted = true;
+            self.cancel_handoff();
+            self.ad_recovery = playback::AdRecovery::default();
             self.qualities.clear();
             self.playing.clear();
             self.status.clear();
@@ -1080,9 +1091,7 @@ impl App {
                     self.buffer = 0.0;
                     self.health.loaded(Instant::now());
                 }
-                if let Some(url) = self.qualities.last().map(|q| q.1.clone()) {
-                    self.ad_monitor = Some(twitch::start_ad_monitor(&self.net, url, self.stream_id, self.ad_detected));
-                }
+                self.monitor_playing();
             }
             Ev::Clips(c, list) if c == self.chan => { self.clips = list; self.clips_loaded = true; }
             Ev::Clips(..) => {}
@@ -1093,28 +1102,27 @@ impl App {
                 tlog(&format!("AdStatus: {is_ad} (was {})", self.ad_detected));
                 let ended = self.ad_detected && !is_ad;
                 self.ad_detected = is_ad;
-                // El cambio automático a un token anónimo podía dejar a mpv en una URL agotada.
-                // Al terminar el bloque se renuevan token y playlist de la sesión actual.
-                if ended && !self.paused && !self.rewound && self.stream_pending.is_none() {
+                if is_ad { self.request_ad_skip(false); }
+                // Un directo que ya volvió a avanzar no necesita otro corte al terminar el bloque.
+                if ended && !self.paused && !self.rewound && self.stream_pending.is_none()
+                    && !self.ad_recovery.pending() && self.health.needs_attention(Instant::now()) {
                     self.request_stream(self.chan.clone(), "fin del anuncio");
                 }
             }
-            Ev::CleanStream(c, id, _) if c != self.chan || id != self.stream_id || !self.cfg.video || self.stream_pending.is_some() => {}
-            Ev::CleanStream(_, _, Err(e)) => {
+            Ev::CleanStream(c, id, attempt, _) if c != self.chan || id != self.stream_id || attempt != self.ad_attempt || !self.cfg.video || self.stream_pending.is_some() => {}
+            Ev::CleanStream(_, _, _, Err(e)) => {
                 tlog(&format!("CleanStream error: {e}"));
+                self.ad_recovery.failed(Instant::now());
             }
-            Ev::CleanStream(_, _, Ok(q)) => {
-                let pick = q.iter().find(|x| x.0 == self.playing).or(q.first());
-                tlog(&format!("CleanStream OK: {} qualities, picking {:?}", q.len(), pick.map(|p| &p.0)));
-                if let Some(p) = &self.player {
-                    if let Some(clean) = pick {
-                        p.play(&clean.1);
-                        p.set("speed", "1");
-                        p.set("pause", if self.paused { "yes" } else { "no" });
-                        self.catching_up = false;
-                        self.rewound = false;
-                        self.health.loaded(Instant::now());
-                    }
+            Ev::CleanStream(_, _, _, Ok(candidate)) => {
+                if self.paused || self.rewound { self.cancel_handoff(); return; }
+                tlog(&format!("Alternative validated: {}", candidate.selected.0));
+                if self.vid_off {
+                    // No hay un cuadro visible que preservar con la ventana minimizada.
+                    if let Some(p) = &self.player { p.play(&candidate.selected.1); }
+                    self.accept_alternative(candidate);
+                } else {
+                    self.handoff = Some(Handoff { candidate, warmup: playback::Warmup::new(Instant::now()) });
                 }
             }
         }
@@ -1230,11 +1238,13 @@ impl App {
                 self.request_stream(self.chan.clone(), "video activado");
             }
         } else {
+            self.cancel_handoff();
             self.ad_monitor = None;
             self.stream_id = self.stream_id.wrapping_add(1);
             self.stream_pending = None;
             if let Some(gl) = gl {
                 if let Some(ap) = self.ad_player.take() { ap.destroy(gl); }
+                for p in self.retired_players.drain(..) { p.destroy(gl); }
                 if let Some(p) = self.player.take() { p.destroy(gl); }
                 self.qualities.clear();
                 self.playing.clear();
@@ -1244,7 +1254,7 @@ impl App {
 
     /// En Auto, cambia de variante si el tamaño del player lo pide por 3 s seguidos (evita rebotes al redimensionar).
     fn auto_quality(&mut self, ctx: &egui::Context) {
-        if self.cfg.quality != "Auto" || self.player.is_none() || self.chan.is_empty() || self.stream_pending.is_some() || self.paused || self.rewound {
+        if self.cfg.quality != "Auto" || self.player.is_none() || self.chan.is_empty() || self.stream_pending.is_some() || self.paused || self.rewound || self.ad_detected || self.ad_recovery.pending() {
             return;
         }
         let Some(best) = auto_pick(&self.qualities, self.want_h).cloned() else { return };
@@ -1262,6 +1272,7 @@ impl App {
             self.health.loaded(Instant::now());
             self.catching_up = false;
             if let Some(p) = &self.player { p.set("speed", "1"); }
+            self.monitor_playing();
             self.auto_t = None;
         } else {
             ctx.request_repaint_after(Duration::from_secs(3));
@@ -1298,7 +1309,56 @@ impl App {
         Some((start, pos, end))
     }
 
+    fn monitor_playing(&mut self) {
+        if let Some(url) = self.qualities.iter().find(|q| q.0 == self.playing).map(|q| q.1.clone()) {
+            // Fixture de integración local, únicamente con diagnóstico IPC habilitado.
+            let url = std::env::var("TWITCHLITE_TEST_AD_PLAYLIST").ok()
+                .filter(|u| u.starts_with("http://127.0.0.1:") && std::env::var_os("TWITCHLITE_MPV_IPC").is_some()).unwrap_or(url);
+            self.ad_monitor = Some(twitch::start_ad_monitor(&self.net, url, self.stream_id, self.ad_detected));
+            if let Some(pipe) = self.player.as_ref().and_then(|p| p.ipc_name()) { tlog(&format!("Player IPC: {pipe}")); }
+        }
+    }
+
+    fn cancel_handoff(&mut self) {
+        self.ad_attempt = self.ad_attempt.wrapping_add(1);
+        self.ad_recovery.cancel();
+        self.handoff = None;
+        if let Some(p) = self.ad_player.take() { self.retired_players.push(p); }
+    }
+
+    fn request_ad_skip(&mut self, force: bool) {
+        if !self.cfg.video || self.paused || self.rewound || self.stream_pending.is_some() || self.player.is_none() { return; }
+        if !self.ad_recovery.begin(Instant::now(), force) { return; }
+        self.ad_attempt = self.ad_attempt.wrapping_add(1);
+        tlog(&format!("Ad skip attempt #{} ({})", self.ad_attempt, if force { "manual" } else { "automatic" }));
+        twitch::load_stream_clean(&self.net, self.chan.clone(), self.stream_id, self.ad_attempt, self.playing.clone(), self.want_h);
+    }
+
+    fn accept_alternative(&mut self, candidate: twitch::StreamCandidate) {
+        self.stream_id = self.stream_id.wrapping_add(1);
+        self.ad_attempt = self.ad_attempt.wrapping_add(1);
+        self.ad_recovery = playback::AdRecovery::default();
+        self.qualities = candidate.qualities;
+        self.playing = candidate.selected.0;
+        self.ad_detected = false;
+        self.catching_up = false;
+        self.rewound = false;
+        self.buffer = 0.0;
+        self.auto_t = None;
+        self.status.clear();
+        if let Some(p) = &self.player {
+            p.set("volume", &self.cfg.volume.to_string());
+            p.set("mute", if self.muted { "yes" } else { "no" });
+            p.set("speed", "1");
+            p.set("vid", if self.vid_off { "no" } else { "auto" });
+        }
+        self.health.loaded(Instant::now());
+        self.monitor_playing();
+        tlog("Alternative promoted: playback session and monitor replaced");
+    }
+
     fn request_stream(&mut self, chan: String, reason: &str) {
+        self.cancel_handoff();
         self.stream_id = self.stream_id.wrapping_add(1);
         self.stream_pending = Some(Instant::now());
         self.ad_monitor = None;
@@ -1325,6 +1385,12 @@ impl App {
         let now = Instant::now();
         if now.duration_since(self.health_t) < Duration::from_secs(1) { return; }
         self.health_t = now;
+        if (self.paused || self.rewound) && self.ad_recovery.pending() { self.cancel_handoff(); }
+        if self.ad_recovery.expired(now) {
+            self.cancel_handoff();
+            self.ad_recovery.failed(now);
+            tlog("Ad skip: preparation timed out; keeping current playback");
+        }
         if let Some(started) = self.stream_pending {
             if now.duration_since(started) >= Duration::from_secs(40) {
                 self.stream_id = self.stream_id.wrapping_add(1);
@@ -1334,6 +1400,7 @@ impl App {
             }
             return;
         }
+        if self.ad_detected { self.request_ad_skip(false); }
         let pos = self.player.as_ref().and_then(|p| p.num("time-pos"));
         let video = self.player.as_ref().and_then(|p| p.frame_serial());
         // Al navegar a otra página no se dibuja la textura; el audio se sigue vigilando.
@@ -1343,12 +1410,24 @@ impl App {
         let buffer = self.player.as_ref().and_then(|p| p.num("demuxer-cache-duration")).unwrap_or(0.0);
         let behind = self.health.behind(now, buffer, self.cfg.low_latency && !suspended);
         let ended = !suspended && self.player.as_ref().is_some_and(|p| p.flag("eof-reached") || p.flag("idle-active"));
-        if stuck || behind || (ended && self.health.ended(now)) {
+        if stuck && self.ad_recovery.pending() {
+            // Recuperar el principal no cancela la alternativa que se está preparando.
+            if let (Some(p), Some(q)) = (&self.player, self.qualities.iter().find(|q| q.0 == self.playing)) {
+                p.play(&q.1);
+                p.set("speed", "1");
+                self.catching_up = false;
+                self.health.loaded(now);
+                tlog("Ad recovery: stalled current playlist reloaded while alternative prepares");
+            }
+            return;
+        }
+        if (stuck || behind || (ended && self.health.ended(now))) && !self.ad_recovery.pending() {
             self.request_stream(self.chan.clone(), if behind { "volver al borde del directo" } else { "reproducción detenida / reintento" });
         }
     }
 
     fn pick_quality(&mut self, q: Option<(String, String)>) {
+        self.cancel_handoff();
         match q {
             Some(q) => {
                 if let Some(p) = &self.player {
@@ -1367,6 +1446,7 @@ impl App {
         self.catching_up = false;
         self.health.loaded(Instant::now());
         if let Some(p) = &self.player { p.set("speed", "1"); }
+        self.monitor_playing();
         self.cfg.save();
     }
 
@@ -1491,6 +1571,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let Some(gl) = gl {
             if let Some(ap) = self.ad_player.take() { ap.destroy(gl); }
+            for p in self.retired_players.drain(..) { p.destroy(gl); }
             if let Some(p) = self.player.take() { p.destroy(gl); }
         }
     }
