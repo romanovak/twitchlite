@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Download libmpv
+        shell: pwsh
+        run: |
+          $mpvUrl = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20250504-git-20816df.7z/download"
+          Invoke-WebRequest -Uri $mpvUrl -OutFile mpv-dev.7z -MaximumRetryCount 3
+          7z x mpv-dev.7z -ompv-dev
+          Copy-Item mpv-dev/libmpv-2.dll -Destination .
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force
+          Copy-Item target/release/twitchlite.exe -Destination release/
+          Copy-Item libmpv-2.dll -Destination release/
+          Compress-Archive -Path release/* -DestinationPath twitchlite-portable.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            twitchlite-portable.zip
+            release/twitchlite.exe
+            release/libmpv-2.dll

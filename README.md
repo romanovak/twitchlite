@@ -21,25 +21,23 @@ Built with Rust, egui/eframe (OpenGL), and libmpv for video playback.
 - Custom dark theme matching Twitch's design
 - Portable: single exe + libmpv-2.dll, no installer
 
+## Quick Start
+
+Download `twitchlite-portable.zip` from [Releases](https://github.com/romanovak/twitchlite/releases/latest), extract, and double-click `twitchlite.exe`. Everything is included.
+
+If you run only the exe without the DLL, it will auto-download `libmpv-2.dll` on first launch. Without libmpv the app still works in chat-only mode.
+
 ## Requirements
 
 - Windows 10/11
-- [Rust toolchain](https://rustup.rs/) (for building)
-- `libmpv-2.dll` — place it next to the built executable
 
-### Getting libmpv
-
-Download a recent mpv build (e.g. from [mpv.io](https://mpv.io/installation/) or [sourceforge](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/)) and extract `libmpv-2.dll`. Place it in the same directory as `twitchlite.exe`.
-
-Without libmpv the app still works — you get chat-only mode.
-
-## Build
+## Build from source
 
 ```bash
 cargo build --release
 ```
 
-The binary is at `target/release/twitchlite.exe`. Copy `libmpv-2.dll` next to it.
+The binary is at `target/release/twitchlite.exe`. The app auto-downloads `libmpv-2.dll` if missing, or you can place it next to the exe manually.
 
 ## Usage
 

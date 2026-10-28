@@ -1437,11 +1437,29 @@ mod tests {
     }
 }
 
+/// Si libmpv-2.dll no está junto al .exe, intenta descargarlo del release de GitHub.
+fn ensure_libmpv() {
+    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default();
+    let dll = dir.join("libmpv-2.dll");
+    if dll.exists() { return; }
+    eprintln!("libmpv-2.dll no encontrado, descargando…");
+    let url = "https://github.com/romanovak/twitchlite/releases/latest/download/libmpv-2.dll";
+    let Ok(mut resp) = ureq::get(url).call() else {
+        eprintln!("No se pudo descargar libmpv-2.dll — el video no estará disponible.");
+        return;
+    };
+    if let Ok(buf) = resp.body_mut().with_config().limit(80 << 20).read_to_vec() {
+        let _ = std::fs::write(&dll, &buf);
+        eprintln!("libmpv-2.dll descargado ({:.1} MB)", buf.len() as f64 / 1e6);
+    }
+}
+
 fn main() -> eframe::Result {
     std::panic::set_hook(Box::new(|info| {
         tlog(&format!("PANIC: {info}"));
     }));
     tlog("=== START ===");
+    ensure_libmpv();
     let cfg = Cfg::load();
     // sin marco de Windows: la barra superior de la app hace de barra de título (ver ui::top_bar)
     let mut vp = egui::ViewportBuilder::default().with_title("Twitch Lite").with_inner_size([1280.0, 720.0]).with_min_inner_size([360.0, 240.0]).with_decorations(false);
