@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="TwitchLite">
+  <title>TwitchLite</title>
+  <g transform="translate(2 2) scale(2.33333)">
+    <polygon points="6,0 1.714,4.286 1.714,19.714 6.857,19.714 6.857,24 11.143,19.714 14.571,19.714 22.286,12 22.286,0" fill="#9146FF"/>
+    <polygon points="6.857,1.714 20.571,1.714 20.571,11.143 17.143,14.571 13.714,14.571 10.714,17.571 10.714,14.571 6.857,14.571" fill="#fff"/>
+    <path d="M11.571 4.714h1.714v5.143h-1.714zM16.286 4.714H18v5.143h-1.714z" fill="#9146FF"/>
+  </g>
+  <rect x="27" y="44" width="36" height="19" rx="4" fill="#101014" stroke="#244329"/>
+  <text x="45" y="59" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="15" font-weight="600" fill="#39FF14">lite</text>
+</svg>

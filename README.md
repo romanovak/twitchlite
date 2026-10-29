@@ -1,4 +1,4 @@
-# Twitch Lite
+# TwitchLite
 
 A lightweight, native Twitch client for Windows. Minimal resource usage, no Electron, no browser engine.
 
@@ -15,9 +15,10 @@ Built with Rust, egui/eframe (OpenGL), and libmpv for video playback.
 - Animated emotes (GIF/WebP) with atlas packing
 - Twemoji rendering
 - Channel points, drops, subscriptions, notifications
-- Ad detection, automatic freeze recovery, and return to live playback
+- Automatic playback recovery and return to live
 - Compact purple refresh control below the video, with a pulse when recovery is needed
-- Native desktop notifications with Twitch Lite branding
+- Native desktop notifications with TwitchLite branding
+- Twitch logo with a small neon green lite badge across the app, taskbar, executable and notifications
 - Theater mode, always-on-top, chat overlay
 - Keyboard shortcuts (K/Space, M, F, T, C, F5 to refresh)
 - Custom dark theme matching Twitch's design
@@ -25,7 +26,7 @@ Built with Rust, egui/eframe (OpenGL), and libmpv for video playback.
 
 ## Quick Start
 
-Download the versioned ZIP, such as `TwitchLite-Portable-Windows-v0.1.2.zip`, from [TwitchLite Portable Windows](https://github.com/romanovak/twitchlite/releases/latest), extract, and double-click `twitchlite.exe`. Everything is included in this single download.
+Download the versioned ZIP, such as `TwitchLite-Portable-Windows-v0.1.3.zip`, from [TwitchLite Portable Windows](https://github.com/romanovak/twitchlite/releases/latest), extract, and double-click `twitchlite.exe`. Everything is included in this single download.
 
 If you run only the exe without the DLL, it will retrieve `libmpv-2.dll` from that version's portable ZIP on first launch. Without libmpv the app still works in chat-only mode.
 
@@ -61,15 +62,17 @@ You can watch any public stream and read chat without logging in. Login is neede
 
 ## Configuration
 
+### App identity
+
+The executable includes Windows icon resources and product/version information. Native windows, the chat popout and desktop notifications use the same TwitchLite icon. Notification icons are versioned so Windows refreshes the previous image automatically. Branding assets are embedded in the executable; no extra icon files are needed beside it. See [assets](assets/README.md) for the source and regeneration command.
+
 Config is saved at `%APPDATA%\TwitchLite\config.json`. Diagnostic logs are in `%APPDATA%\TwitchLite\twitchlite.log`. Image cache is at `%LOCALAPPDATA%\TwitchLite\cache` (200 MB limit, auto-pruned).
 
 ### Refresh and recovery
 
 The purple refresh icon sits next to Share in the channel information below the video. It pulses when playback stops advancing, a retry is pending, or the player falls far behind live. It remains steady during normal playback. Hover for the tooltip, or press F5 to renew the playback session and return to live.
 
-When the active video playlist signals an ad, the app automatically requests a fresh alternative. It checks the newest HLS segments for advertising and preloads the candidate in a muted second player. It switches only after that player has drawn moving frames, then replaces the quality list and playlist monitor together. A rejected or stalled candidate leaves the current player intact and uses increasing retry delays. Manual pause and rewind are respected. Twitch must supply live content for the alternative; an uninterrupted stream or an ad-free alternative is not guaranteed.
-
-Recovery keeps retrying if the live playlist has already moved past the ad while the player remains stuck. A playback stall also triggers the same alternative search as Skip Ad, even without an ad marker. Once an alternative has played successfully, its playback route is tried first for later refreshes and channel changes during the current app session. Each channel receives a fresh token and playlist; if that route is unavailable or contains advertising, the current web session is used as a fallback. Ad detection merges later updates to the same ad marker and checks both segments where mpv can start playback.
+The app monitors playback and attempts to recover automatically when needed. Manual pause and rewind are respected. Playback availability depends on the stream and network conditions.
 
 ### Validation
 
@@ -77,7 +80,7 @@ Recovery keeps retrying if the live playlist has already moved past the ad while
 cargo test --locked
 ```
 
-The tests cover frozen video with advancing audio, startup, retry delays, intentional pause, the refresh attention state, repeated ad breaks interrupted by a simulated network failure, delayed ad-end metadata, and playback route fallback across channel requests.
+The tests cover playback health, startup, retries, user controls, and session handling.
 
 For a manual recovery check with the actual libmpv runtime, launch a single app instance with local diagnostic IPC enabled, then run the helper:
 
@@ -89,8 +92,6 @@ Remove-Item Env:TWITCHLITE_MPV_IPC
 ```
 
 The helper deliberately pauses mpv, verifies that the app reconnects without a manual refresh, and checks that playback advances afterward. Close and reopen the app normally after the check; IPC is disabled unless the environment variable is set. Verbose mpv logging is opt-in through `TWITCHLITE_MPV_LOG`; keep those logs private because playback URLs can contain session tokens.
-
-For ad handoff integration tests, `TWITCHLITE_TEST_AD_PLAYLIST` can point the monitor at a loopback HTTP fixture. This override is accepted only for `http://127.0.0.1:` while diagnostic IPC is enabled. The actual alternative playback still uses Twitch; a simulated marker does not prove that Twitch will supply an alternative during every real ad break.
 
 ## Architecture
 

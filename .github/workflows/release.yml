@@ -79,4 +79,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: TwitchLite Portable Windows ${{ github.ref_name }}
+          # Keep public update notes brief, general, and in English.
+          body: |
+            General maintenance and refinements to the Windows experience.
+
+            Download the portable ZIP below, extract all files, and run **twitchlite.exe**. No installation is required.
+          generate_release_notes: false
           files: TwitchLite-Portable-Windows-${{ github.ref_name }}.zip

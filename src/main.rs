@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod img;
+mod branding;
 mod mpv;
 mod notifications;
 mod playback;
@@ -1635,7 +1636,7 @@ mod tests {
     #[ignore]
     fn toast_shows() {
         notifications::init();
-        notifications::show("Te mencionaron en #testchannel", "Prueba de notificación de Twitch Lite").unwrap();
+        notifications::show("TwitchLite está listo", "Logo de Twitch + lite en verde neón. Prueba de notificación.").unwrap();
     }
 
     #[test]
@@ -1714,13 +1715,13 @@ fn main() -> eframe::Result {
     notifications::init();
     let cfg = Cfg::load();
     // sin marco de Windows: la barra superior de la app hace de barra de título (ver ui::top_bar)
-    let mut vp = egui::ViewportBuilder::default().with_title("Twitch Lite").with_inner_size([1280.0, 720.0]).with_min_inner_size([360.0, 240.0]).with_decorations(false);
+    let mut vp = egui::ViewportBuilder::default().with_title(branding::NAME).with_icon(branding::window_icon()).with_inner_size([1280.0, 720.0]).with_min_inner_size([360.0, 240.0]).with_decorations(false);
     if cfg.on_top {
         vp = vp.with_always_on_top();
     }
     let opts = eframe::NativeOptions { viewport: vp, renderer: eframe::Renderer::Glow, ..Default::default() };
     eframe::run_native(
-        "Twitch Lite",
+        branding::NAME,
         opts,
         Box::new(|cc| {
             ui::style(&cc.egui_ctx);

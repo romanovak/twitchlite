@@ -127,7 +127,7 @@ impl Player {
                 // HLS en vivo no es "seekable" para mpv; esto deja recorrer lo que ya está en caché
                 ("demuxer-seekable-cache", "yes"),
                 ("force-seekable", "yes"),
-                ("audio-client-name", "Twitch Lite"),
+                ("audio-client-name", crate::branding::NAME),
                 ("volume", vol.as_str()),
                 ("mute", if standby { "yes" } else { "no" }),
             ] {

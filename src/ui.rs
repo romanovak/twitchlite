@@ -322,27 +322,9 @@ fn paint_icon(p: &Painter, r: Rect, icon: Icon, c: Color32) {
     }
 }
 
-/// Logo de Twitch (placeholder de pruebas) dibujado con sus polígonos originales en una caja de 40x40.
-/// Los polígonos son cóncavos pero con forma de estrella respecto a `k`: un abanico desde ahí los rellena bien.
+/// Misma marca que Windows y las notificaciones: Twitch con el distintivo lite en verde neón.
 fn paint_logo(p: &Painter, r: Rect) {
-    let s = r.width() / 40.0;
-    let at = |x: f32, y: f32| r.min + vec2(x, y) * s;
-    let fan = |pts: &[(f32, f32)], k: (f32, f32), c: Color32| {
-        let mut m = egui::Mesh::default();
-        m.colored_vertex(at(k.0, k.1), c);
-        for &(x, y) in pts {
-            m.colored_vertex(at(x, y), c);
-        }
-        let n = pts.len() as u32;
-        for i in 0..n {
-            m.add_triangle(0, 1 + i, 1 + (i + 1) % n);
-        }
-        p.add(m);
-    };
-    fan(&[(13., 8.), (8., 13.), (8., 31.), (14., 31.), (14., 36.), (19., 31.), (23., 31.), (32., 22.), (32., 8.)], (16., 20.), PURPLE_L);
-    fan(&[(26., 25.), (30., 21.), (30., 10.), (14., 10.), (14., 25.), (18., 25.), (18., 29.), (22., 25.)], (20., 18.), Color32::WHITE);
-    p.rect_filled(Rect::from_min_max(at(20., 14.), at(22., 20.)), 0.0, PURPLE_L);
-    p.rect_filled(Rect::from_min_max(at(25., 14.), at(27., 20.)), 0.0, PURPLE_L);
+    crate::branding::paint_logo(p, r);
 }
 
 fn icon_btn(ui: &mut Ui, icon: Icon, active: bool, tip: &str) -> Response {
@@ -876,8 +858,8 @@ impl App {
     /// mismo hilo de IRC: no cuesta otra conexión). Cerrarla lo regresa a la ventana principal.
     fn chat_popout(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        let title = format!("Chat de {}", if self.info.name.is_empty() { &self.chan } else { &self.info.name });
-        let vb = egui::ViewportBuilder::default().with_title(title).with_inner_size([360.0, 680.0]).with_min_inner_size([260.0, 320.0]).with_always_on_top();
+        let title = format!("TwitchLite · Chat de {}", if self.info.name.is_empty() { &self.chan } else { &self.info.name });
+        let vb = egui::ViewportBuilder::default().with_title(title).with_icon(crate::branding::window_icon()).with_inner_size([360.0, 680.0]).with_min_inner_size([260.0, 320.0]).with_always_on_top();
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("chat_popout"), vb, |ui, _| {
             self.chat_open = true;
             self.chat(ui, false);
@@ -1421,9 +1403,14 @@ impl App {
                 ui.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
             ui.horizontal_centered(|ui| {
-                let (r, logo) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
-                paint_logo(ui.painter(), r);
-                if logo.on_hover_text("Inicio").clicked() {
+                let wide_brand = ui.max_rect().width() >= 1100.0;
+                let (r, logo) = ui.allocate_exact_size(vec2(if wide_brand { 130.0 } else { 40.0 }, 40.0), Sense::click());
+                paint_logo(ui.painter(), Rect::from_min_size(r.min, vec2(40.0, 40.0)));
+                if wide_brand {
+                    ui.painter().text(pos2(r.left() + 46.0, r.center().y), Align2::LEFT_CENTER, "Twitch", semi(18.0), TEXT);
+                    ui.painter().text(pos2(r.left() + 105.0, r.center().y + 4.0), Align2::LEFT_CENTER, "lite", semi(11.0), crate::branding::NEON);
+                }
+                if logo.on_hover_text("TwitchLite · Inicio").clicked() {
                     self.go(Page::Following);
                 }
                 ui.add_space(14.0);
@@ -3011,6 +2998,15 @@ impl App {
                                 menu_sep(ui);
                                 let (used, budget, n) = self.store.stats();
                                 hint(ui, &format!("Imágenes en memoria: {used}/{budget} MB · {n}"));
+                                menu_sep(ui);
+                                ui.horizontal(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+                                    paint_logo(ui.painter(), r);
+                                    ui.vertical(|ui| {
+                                        ui.label(RichText::new(crate::branding::NAME).font(semi(13.0)).color(TEXT));
+                                        ui.label(RichText::new(format!("v{} · Romanovak", crate::branding::VERSION)).color(DIM).small());
+                                    });
+                                });
                             }
                             5 => {
                                 for (k, what) in [
@@ -3189,6 +3185,15 @@ impl App {
         let mut open = true;
         egui::Window::new(RichText::new("Iniciar sesión").font(semi(16.0))).open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ui.ctx(), |ui| {
             ui.set_width(360.0);
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
+                paint_logo(ui.painter(), r);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(crate::branding::NAME).font(semi(20.0)).color(TEXT));
+                    ui.label(RichText::new("Conecta tu cuenta de Twitch").color(DIM).small());
+                });
+            });
+            ui.add_space(12.0);
             ui.label(RichText::new("1. Abre Twitch e inicia sesión").font(semi(13.0)).color(TEXT));
             if ui.add(egui::Button::new(RichText::new("Abrir twitch.tv").color(Color32::WHITE)).fill(PURPLE).corner_radius(4)).clicked() {
                 let _ = std::process::Command::new("cmd").args(["/C", "start", "https://www.twitch.tv"]).spawn();
