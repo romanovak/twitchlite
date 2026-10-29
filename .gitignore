@@ -6,6 +6,7 @@
 /mpv-dev.7z
 /twitchlite-portable.zip
 /TwitchLite-Portable-Windows.zip
+/TwitchLite-Portable-Windows-v*.zip
 *.exe
 *.dll
 *.log

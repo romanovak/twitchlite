@@ -106,13 +106,14 @@ impl Player {
                 return Err("mpv_create falló".into());
             }
             let vol = volume.to_string();
+            let live_start = format!("live_start_index=-{}", crate::playback::LIVE_START_SEGMENTS);
             for (k, v) in [
                 // escaladores bilineales, sin dither ni texturas intermedias de 16 bits: menos VRAM y GPU
                 ("profile", "fast"),
                 ("hwdec-extra-frames", "2"),
                 ("demuxer-readahead-secs", "6"),
                 // HLS: arranca cerca del borde y limita lecturas atascadas tras una discontinuidad.
-                ("demuxer-lavf-o", "live_start_index=-2"),
+                ("demuxer-lavf-o", live_start.as_str()),
                 ("network-timeout", "10"),
                 ("vo", "libmpv"),
                 // Decodifica en GPU y copia el frame: sin esto mpv inicializa CUDA/Vulkan para interop (~1 GB comprometido)

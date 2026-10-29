@@ -1,32 +1,40 @@
 use std::time::{Duration, Instant};
 
+pub const LIVE_START_SEGMENTS: usize = 2;
+
 /// Una sola búsqueda/preparación a la vez; los fallos no disparan un bucle de recargas.
 #[derive(Default)]
 pub struct AdRecovery {
     pending: Option<Instant>,
     retry_at: Option<Instant>,
     failures: u32,
+    wanted: bool,
 }
 
 impl AdRecovery {
     pub fn begin(&mut self, now: Instant, force: bool) -> bool {
         if self.pending.is_some() || (!force && self.retry_at.is_some_and(|t| now < t)) { return false; }
         self.pending = Some(now);
+        self.wanted = true;
         true
     }
 
     pub fn pending(&self) -> bool { self.pending.is_some() }
+    // El borde del HLS puede salir del anuncio antes de que el reproductor lo haya superado.
+    pub fn needs_retry(&self, ad_detected: bool) -> bool { ad_detected || self.wanted }
     pub fn expired(&self, now: Instant) -> bool {
         self.pending.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(20))
     }
 
     pub fn failed(&mut self, now: Instant) {
         self.pending = None;
+        self.wanted = true;
         self.retry_at = Some(now + Duration::from_secs((2u64 << self.failures.min(3)).min(15)));
         self.failures = self.failures.saturating_add(1);
     }
 
-    pub fn cancel(&mut self) { self.pending = None; }
+    pub fn interrupted(&mut self) { self.pending = None; }
+    pub fn cancel(&mut self) { self.interrupted(); self.wanted = false; }
 }
 
 pub struct Warmup {
@@ -159,6 +167,46 @@ mod tests {
         assert!(r.begin(t, false));
         r.cancel();
         assert!(!r.pending());
+    }
+
+    #[test]
+    fn failed_skip_keeps_retrying_when_the_live_edge_has_already_left_the_ad() {
+        let t = Instant::now();
+        let mut r = AdRecovery::default();
+        assert!(r.needs_retry(true));
+        assert!(r.begin(t, false));
+        r.failed(t);
+        // El monitor ya dice false, pero el principal sigue en los segmentos anteriores.
+        assert!(r.needs_retry(false));
+        assert!(!r.begin(t + Duration::from_secs(1), false));
+        r.interrupted(); // Renovar la sesión principal tampoco debe perder el reintento pendiente.
+        assert!(r.needs_retry(false));
+        assert!(!r.begin(t + Duration::from_secs(1), false));
+        assert!(r.begin(t + Duration::from_secs(2), false));
+        assert!(!r.begin(t + Duration::from_secs(2), true));
+        r.cancel();
+        assert!(!r.needs_retry(false));
+    }
+
+    #[test]
+    fn repeated_breaks_and_timeouts_do_not_require_manual_skip_to_rearm() {
+        let mut t = Instant::now();
+        let mut r = AdRecovery::default();
+        for _ in 0..8 {
+            assert!(r.begin(t, false));
+            t += Duration::from_secs(20);
+            assert!(r.expired(t));
+            r.cancel();
+            r.failed(t);
+            assert!(r.needs_retry(false));
+            t += Duration::from_secs(2);
+            assert!(r.begin(t, false));
+            // Una alternativa aceptada o un cambio de canal cancela el ciclo anterior.
+            r = AdRecovery::default();
+            assert!(!r.needs_retry(false));
+            t += Duration::from_secs(120);
+            assert!(r.needs_retry(true));
+        }
     }
 
     #[test]

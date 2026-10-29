@@ -471,6 +471,7 @@ struct App {
     auto_t: Option<Instant>,
     stream_id: u64,
     stream_pending: Option<Instant>,
+    preferred_route: twitch::PlaybackRoute,
     health: playback::Health,
     health_t: Instant,
     ad_monitor: Option<twitch::AdMonitor>,
@@ -602,6 +603,7 @@ impl App {
             auto_t: None,
             stream_id: 0,
             stream_pending: None,
+            preferred_route: twitch::PlaybackRoute::default(),
             health: playback::Health::new(Instant::now()),
             health_t: Instant::now(),
             ad_monitor: None,
@@ -1060,11 +1062,11 @@ impl App {
                 self.status = format!("{e}. Reintentando automáticamente…");
                 self.qualities.clear();
             }
-            Ev::Stream(_, _, Ok(q)) => {
-                tlog(&format!("Stream OK: {} qualities", q.len()));
+            Ev::Stream(_, _, Ok(candidate)) => {
+                tlog(&format!("Stream OK: {} qualities ({:?})", candidate.qualities.len(), candidate.route));
                 self.stream_pending = None;
                 self.status.clear();
-                self.qualities = q;
+                self.qualities = candidate.qualities;
                 if self.player.is_none() {
                     match self.get_proc.clone().map(|gp| mpv::Player::new(gp, self.net.ctx.clone(), self.cfg.volume)) {
                         Some(Ok(p)) => self.player = Some(p),
@@ -1072,12 +1074,11 @@ impl App {
                         None => self.status = "Sin contexto OpenGL".into(),
                     }
                 }
-                let manual = self.qualities.iter().find(|q| q.0 == self.cfg.quality);
-                let pick = manual.or_else(|| auto_pick(&self.qualities, self.want_h)).or(self.qualities.first()).cloned();
-                if manual.is_none() {
+                if !self.qualities.iter().any(|q| q.0 == self.cfg.quality) {
                     self.cfg.quality = "Auto".into();
                 }
-                if let (Some(p), Some(q)) = (&self.player, pick) {
+                if let Some(p) = &self.player {
+                    let q = candidate.selected;
                     p.play(&q.1);
                     p.set("speed", "1");
                     self.catching_up = false;
@@ -1320,8 +1321,13 @@ impl App {
     }
 
     fn cancel_handoff(&mut self) {
-        self.ad_attempt = self.ad_attempt.wrapping_add(1);
+        self.discard_handoff();
         self.ad_recovery.cancel();
+    }
+
+    fn discard_handoff(&mut self) {
+        self.ad_attempt = self.ad_attempt.wrapping_add(1);
+        self.ad_recovery.interrupted();
         self.handoff = None;
         if let Some(p) = self.ad_player.take() { self.retired_players.push(p); }
     }
@@ -1338,6 +1344,8 @@ impl App {
         self.stream_id = self.stream_id.wrapping_add(1);
         self.ad_attempt = self.ad_attempt.wrapping_add(1);
         self.ad_recovery = playback::AdRecovery::default();
+        // Se recuerda la ruta que funcionó, nunca el token ni la URL de otro canal.
+        self.preferred_route = candidate.route;
         self.qualities = candidate.qualities;
         self.playing = candidate.selected.0;
         self.ad_detected = false;
@@ -1358,7 +1366,7 @@ impl App {
     }
 
     fn request_stream(&mut self, chan: String, reason: &str) {
-        self.cancel_handoff();
+        self.discard_handoff();
         self.stream_id = self.stream_id.wrapping_add(1);
         self.stream_pending = Some(Instant::now());
         self.ad_monitor = None;
@@ -1366,7 +1374,8 @@ impl App {
         self.status = "Reconectando al directo…".into();
         self.controls_t = Instant::now();
         tlog(&format!("Refresh #{}: {reason}", self.stream_id));
-        twitch::load_stream(&self.net, chan, self.session(), self.stream_id);
+        let preferred = if self.cfg.quality == "Auto" { String::new() } else { self.cfg.quality.clone() };
+        twitch::load_stream(&self.net, chan, self.session(), self.stream_id, self.preferred_route, preferred, self.want_h);
         self.net.ctx.request_repaint();
     }
 
@@ -1385,7 +1394,7 @@ impl App {
         let now = Instant::now();
         if now.duration_since(self.health_t) < Duration::from_secs(1) { return; }
         self.health_t = now;
-        if (self.paused || self.rewound) && self.ad_recovery.pending() { self.cancel_handoff(); }
+        if (self.paused || self.rewound) && self.ad_recovery.needs_retry(false) { self.cancel_handoff(); }
         if self.ad_recovery.expired(now) {
             self.cancel_handoff();
             self.ad_recovery.failed(now);
@@ -1400,7 +1409,7 @@ impl App {
             }
             return;
         }
-        if self.ad_detected { self.request_ad_skip(false); }
+        if self.ad_recovery.needs_retry(self.ad_detected) { self.request_ad_skip(false); }
         let pos = self.player.as_ref().and_then(|p| p.num("time-pos"));
         let video = self.player.as_ref().and_then(|p| p.frame_serial());
         // Al navegar a otra página no se dibuja la textura; el audio se sigue vigilando.
@@ -1410,6 +1419,8 @@ impl App {
         let buffer = self.player.as_ref().and_then(|p| p.num("demuxer-cache-duration")).unwrap_or(0.0);
         let behind = self.health.behind(now, buffer, self.cfg.low_latency && !suspended);
         let ended = !suspended && self.player.as_ref().is_some_and(|p| p.flag("eof-reached") || p.flag("idle-active"));
+        // El mismo salto que funciona a mano también recupera un corte sin marcador de anuncio.
+        if stuck { self.request_ad_skip(false); }
         if stuck && self.ad_recovery.pending() {
             // Recuperar el principal no cancela la alternativa que se está preparando.
             if let (Some(p), Some(q)) = (&self.player, self.qualities.iter().find(|q| q.0 == self.playing)) {
@@ -1632,22 +1643,65 @@ mod tests {
         assert_eq!(hhmm(0, 0), "0:00");
         assert_eq!(hhmm(1_792_630_870_000, -6 * 3600), "19:01"); // 01:01 UTC en CDMX
     }
+
+    #[test]
+    fn runtime_is_read_only_from_the_bundled_dll_entry() {
+        use std::io::{Cursor, Write};
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("twitchlite.exe", options).unwrap();
+        archive.write_all(b"executable stays untouched").unwrap();
+        let without_dll = archive.finish().unwrap().into_inner();
+        assert!(bundled_runtime(&without_dll).is_err());
+        let mut archive = zip::ZipWriter::new_append(Cursor::new(without_dll)).unwrap();
+        archive.start_file("libmpv-2.dll", options).unwrap();
+        archive.write_all(b"MZruntime").unwrap();
+        let package = archive.finish().unwrap().into_inner();
+        assert_eq!(bundled_runtime(&package).unwrap(), b"MZruntime");
+        assert!(bundled_runtime(b"not a ZIP").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a local portable ZIP and its verified DLL"]
+    fn runtime_from_portable_archive() {
+        let package = std::fs::read(std::env::var_os("TWITCHLITE_TEST_PACKAGE").expect("ZIP path")).unwrap();
+        let runtime = std::fs::read(std::env::var_os("TWITCHLITE_TEST_RUNTIME").expect("DLL path")).unwrap();
+        assert_eq!(bundled_runtime(&package).unwrap(), runtime);
+    }
 }
 
-/// Si libmpv-2.dll no está junto al .exe, intenta descargarlo del release de GitHub.
+fn bundled_runtime(package: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(package)).map_err(|e| e.to_string())?;
+    let file = archive.by_name("libmpv-2.dll").map_err(|e| e.to_string())?;
+    let expected = file.size();
+    if expected == 0 || expected > 256 << 20 { return Err("Tamaño de libmpv inválido".into()); }
+    let mut dll = Vec::new();
+    file.take((256 << 20) + 1).read_to_end(&mut dll).map_err(|e| e.to_string())?;
+    if dll.len() as u64 != expected { return Err("libmpv incompleto".into()); }
+    Ok(dll)
+}
+
+/// El ZIP es la única descarga pública: también contiene el runtime para una copia sin DLL.
 fn ensure_libmpv() {
     let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default();
     let dll = dir.join("libmpv-2.dll");
     if dll.exists() { return; }
-    eprintln!("libmpv-2.dll no encontrado, descargando…");
-    let url = "https://github.com/romanovak/twitchlite/releases/latest/download/libmpv-2.dll";
-    let Ok(mut resp) = ureq::get(url).call() else {
-        eprintln!("No se pudo descargar libmpv-2.dll — el video no estará disponible.");
-        return;
-    };
-    if let Ok(buf) = resp.body_mut().with_config().limit(256 << 20).read_to_vec() {
-        let _ = std::fs::write(&dll, &buf);
-        eprintln!("libmpv-2.dll descargado ({:.1} MB)", buf.len() as f64 / 1e6);
+    tlog("Falta libmpv-2.dll; obteniendo el runtime del ZIP portable");
+    let result = (|| -> Result<(), String> {
+        let version = env!("CARGO_PKG_VERSION");
+        let url = format!("https://github.com/romanovak/twitchlite/releases/download/v{version}/TwitchLite-Portable-Windows-v{version}.zip");
+        let mut response = ureq::get(&url).call().map_err(|e| e.to_string())?;
+        let package = response.body_mut().with_config().limit(256 << 20).read_to_vec().map_err(|e| e.to_string())?;
+        let runtime = bundled_runtime(&package)?;
+        let temp = dll.with_extension("dll.download");
+        std::fs::write(&temp, runtime).map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, &dll).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => tlog("libmpv-2.dll extraído del ZIP portable"),
+        Err(e) => tlog(&format!("No se pudo preparar libmpv: {e}")),
     }
 }
 
@@ -1655,7 +1709,7 @@ fn main() -> eframe::Result {
     std::panic::set_hook(Box::new(|info| {
         tlog(&format!("PANIC: {info}"));
     }));
-    tlog("=== START ===");
+    tlog(&format!("=== START TwitchLite {} ===", env!("CARGO_PKG_VERSION")));
     ensure_libmpv();
     notifications::init();
     let cfg = Cfg::load();

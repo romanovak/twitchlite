@@ -50,6 +50,7 @@ if (!$SkipBaseline) {
 }
 
 $faultCount = Refresh-Count
+$faultLine = @(Get-Content -LiteralPath $LogPath).Count
 $started = [DateTime]::UtcNow
 Invoke-Mpv @('set_property', 'pause', $true) | Out-Null
 Write-Output 'Fallo controlado: mpv en pausa sin cambiar el estado de pausa de la aplicación.'
@@ -67,7 +68,10 @@ $resumed = Get-MpvPosition
 Start-Sleep -Seconds 4
 $advanced = Invoke-Mpv @('get_property', 'time-pos')
 if ($advanced -le $resumed + 1) { throw 'mpv salió de pausa pero el directo no avanzó' }
-if ((Refresh-Count) -ne $faultCount + 1) { throw 'Se esperaba una sola reconexión para el fallo' }
-$reason = (Select-String -LiteralPath $LogPath -Pattern 'Refresh #' | Select-Object -Last 1).Line
-if ($reason -notlike '*reproducción detenida / reintento*') { throw "La recuperación tuvo otra causa: $reason" }
-Write-Output "PASS: recuperación automática en $seconds s, una reconexión y video avanzando ($resumed -> $advanced)."
+$recoveryLines = @(Get-Content -LiteralPath $LogPath | Select-Object -Skip $faultLine)
+if ($recoveryLines -match 'refresh manual|Ad skip attempt .*manual') { throw 'Una acción manual contaminó la prueba' }
+if (!(($recoveryLines -match 'Ad skip attempt .*automatic') -or ($recoveryLines -match 'reproducción detenida / reintento'))) {
+    throw 'No se registró recuperación automática para el fallo'
+}
+if ((Refresh-Count) -gt $faultCount + 1) { throw 'La recuperación entró en un bucle de recargas' }
+Write-Output "PASS: recuperación automática en $seconds s y video avanzando ($resumed -> $advanced)."

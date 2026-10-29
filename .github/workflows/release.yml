@@ -10,6 +10,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PACKAGE_NAME: TwitchLite-Portable-Windows-${{ github.ref_name }}.zip
     steps:
       - name: Preserve an already published portable release
         id: published
@@ -25,7 +27,7 @@ jobs:
             $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
             $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:RELEASE_REPO/releases/tags/$tag" -Headers $headers
             $names = @($release.assets.name)
-            $exists = !$release.draft -and ($names -contains 'TwitchLite-Portable-Windows.zip') -and ($names -contains 'libmpv-2.dll') -and ($names -contains 'SHA256SUMS.txt')
+            $exists = !$release.draft -and ($names -contains $env:PACKAGE_NAME)
           } catch {
             if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
           }
@@ -49,39 +51,32 @@ jobs:
         shell: pwsh
         env:
           RELEASE_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $base = "https://github.com/$env:RELEASE_REPO/releases/latest/download"
-          Invoke-WebRequest -Uri "$base/libmpv-2.dll" -OutFile libmpv-2.dll -MaximumRetryCount 3
-          $checks = (Invoke-WebRequest -Uri "$base/SHA256SUMS.txt").Content
-          if ($checks -is [byte[]]) { $checks = [Text.Encoding]::UTF8.GetString($checks) }
-          $entry = $checks -split '\r?\n' | Where-Object { $_ -match '^[a-fA-F0-9]{64}\s+libmpv-2\.dll$' } | Select-Object -First 1
-          if (!$entry) { throw 'The video runtime checksum is missing' }
-          $expected = ($entry -split '\s+')[0]
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+          $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:RELEASE_REPO/releases/latest" -Headers $headers
+          $asset = @($latest.assets | Where-Object { $_.name -like 'TwitchLite-Portable-Windows-v*.zip' })
+          if ($asset.Count -ne 1) { throw 'The latest portable ZIP is missing or ambiguous' }
+          Invoke-WebRequest -Uri $asset[0].browser_download_url -OutFile runtime.zip -MaximumRetryCount 3
+          Expand-Archive -LiteralPath runtime.zip -DestinationPath runtime
+          Copy-Item -LiteralPath runtime/libmpv-2.dll -Destination libmpv-2.dll
+          $expected = '9197a10dd712a15d652ccb2e915f47e377605599bc9faa9a137bb8a1ef2bb6c4'
           if ((Get-FileHash libmpv-2.dll).Hash -ne $expected) { throw 'The video runtime checksum does not match' }
 
       - name: Package
         if: steps.published.outputs.exists != 'true'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path release -Force | Out-Null
-          Copy-Item target/release/twitchlite.exe -Destination release/
-          Copy-Item libmpv-2.dll -Destination release/
-          Copy-Item README.md -Destination release/README.md
-          Copy-Item LICENSE -Destination release/LICENSE.txt
-          Compress-Archive -Path release/* -DestinationPath TwitchLite-Portable-Windows.zip
-          $checks = @('TwitchLite-Portable-Windows.zip', 'release/twitchlite.exe', 'release/libmpv-2.dll') | ForEach-Object {
-            $hash = Get-FileHash -LiteralPath $_
-            '{0}  {1}' -f $hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $_)
-          }
-          $checks | Set-Content -Path SHA256SUMS.txt -Encoding utf8
+          New-Item -ItemType Directory -Path portable -Force | Out-Null
+          Copy-Item target/release/twitchlite.exe -Destination portable/
+          Copy-Item libmpv-2.dll -Destination portable/
+          Copy-Item README.md -Destination portable/README.txt
+          Copy-Item LICENSE -Destination portable/LICENSE.txt
+          Compress-Archive -LiteralPath (Get-ChildItem -LiteralPath portable -File).FullName -DestinationPath $env:PACKAGE_NAME
 
       - name: Publish TwitchLite Portable Windows
         if: steps.published.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          name: TwitchLite Portable Windows
-          files: |
-            TwitchLite-Portable-Windows.zip
-            release/twitchlite.exe
-            release/libmpv-2.dll
-            SHA256SUMS.txt
+          name: TwitchLite Portable Windows ${{ github.ref_name }}
+          files: TwitchLite-Portable-Windows-${{ github.ref_name }}.zip

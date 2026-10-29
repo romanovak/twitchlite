@@ -1,7 +1,7 @@
 // Red: IRC del chat, APIs de emotes (7TV/BTTV/FFZ), Helix, login por device code y stream HLS.
 // Todo corre en hilos con ureq/rustls bloqueantes y habla con la UI por un canal mpsc.
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -161,9 +161,17 @@ pub struct Irc {
     pub text: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaybackRoute {
+    #[default]
+    Site,
+    Embed,
+}
+
 pub struct StreamCandidate {
     pub qualities: Vec<(String, String)>,
     pub selected: (String, String),
+    pub route: PlaybackRoute,
 }
 
 pub enum Ev {
@@ -177,7 +185,7 @@ pub enum Ev {
     Top(Vec<Live>),
     Avatar(String),
     MyEmotes(Vec<(String, String)>),
-    Stream(String, u64, Result<Vec<(String, String)>, String>),
+    Stream(String, u64, Result<StreamCandidate, String>),
     Info(String, ChanInfo),
     Points(String, u64),
     Bits(u64),
@@ -864,11 +872,21 @@ pub fn device_login(net: &Net, cid: String) {
 
 /// Con tu sesión de twitch.tv el token de reproducción sale a tu nombre: si estás suscrito al canal
 /// o tienes Turbo, Twitch no mete anuncios (igual que en la web).
-pub fn load_stream(net: &Net, chan: String, session: Option<String>, request: u64) {
+pub fn load_stream(net: &Net, chan: String, session: Option<String>, request: u64, route: PlaybackRoute, preferred: String, height: u32) {
     net.spawn(move |net| {
-        let res = stream_qualities(&chan, session.as_deref(), "site");
+        let res = with_playback_route(route, |route| stream_candidate(&chan, session.as_deref(), route, &preferred, height));
         net.send(Ev::Stream(chan, request, res));
     });
+}
+
+fn with_playback_route<T>(preferred: PlaybackRoute, mut fetch: impl FnMut(PlaybackRoute) -> Result<T, String>) -> Result<T, String> {
+    match fetch(preferred) {
+        Err(e) if preferred == PlaybackRoute::Embed => {
+            crate::tlog(&format!("Preferred alternative unavailable: {e}; trying current web session"));
+            fetch(PlaybackRoute::Site)
+        }
+        result => result,
+    }
 }
 
 fn playback_agent() -> &'static ureq::Agent {
@@ -910,7 +928,7 @@ pub fn start_ad_monitor(net: &Net, variant_url: String, request: u64, mut was_ad
             let delay = if first { Duration::ZERO } else { Duration::from_secs(2) };
             first = false;
             if !matches!(stop.recv_timeout(delay), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { return; }
-            let body = match agent().get(&variant_url).call().and_then(|mut r| Ok(r.body_mut().read_to_string()?)) {
+            let body = match playback_agent().get(&variant_url).call().and_then(|mut r| Ok(r.body_mut().read_to_string()?)) {
                 Ok(b) => b,
                 Err(e) => {
                     crate::tlog(&format!("AdMonitor: error de red ({e}); reintentando"));
@@ -930,11 +948,31 @@ pub fn start_ad_monitor(net: &Net, variant_url: String, request: u64, mut was_ad
 }
 
 fn playlist_has_ad(body: &str) -> bool {
+    #[derive(Default)]
+    struct Range<'a> {
+        id: Option<&'a str>,
+        class: Option<&'a str>,
+        start: Option<f64>,
+        end: Option<f64>,
+        duration: Option<f64>,
+    }
+    let mut ranges: Vec<Range<'_>> = Vec::new();
+    // HLS puede completar END-DATE en otra etiqueta con el mismo ID.
+    for attrs in body.lines().filter_map(|l| l.strip_prefix("#EXT-X-DATERANGE:")) {
+        let id = hls_attr(attrs, "ID");
+        let index = ranges.iter().position(|r| id.is_some() && r.id == id).unwrap_or_else(|| {
+            ranges.push(Range { id, ..Range::default() });
+            ranges.len() - 1
+        });
+        let range = &mut ranges[index];
+        range.class = hls_attr(attrs, "CLASS").or(range.class);
+        range.start = hls_attr(attrs, "START-DATE").and_then(hls_time).or(range.start);
+        range.end = hls_attr(attrs, "END-DATE").and_then(hls_time).or(range.end);
+        range.duration = hls_attr(attrs, "DURATION").and_then(|n| n.parse::<f64>().ok()).or(range.duration);
+    }
     let mut clock = None;
     let mut duration = None;
-    let mut latest = None;
-    let mut latest_end = None;
-    let mut title_is_ad = false;
+    let mut segments = VecDeque::new();
     let mut next_title_ad = false;
     for line in body.lines() {
         if let Some(date) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
@@ -944,27 +982,23 @@ fn playlist_has_ad(body: &str) -> bool {
             duration = seconds.parse::<f64>().ok();
             next_title_ad = title.contains("Amazon");
         } else if !line.starts_with('#') && !line.trim().is_empty() && duration.is_some() {
-            latest = clock;
-            latest_end = clock.zip(duration).map(|(a, b)| a + b);
-            clock = latest_end;
-            title_is_ad = next_title_ad;
+            let end = clock.zip(duration).map(|(a, b)| a + b);
+            segments.push_back((clock, end, next_title_ad));
+            if segments.len() > crate::playback::LIVE_START_SEGMENTS { segments.pop_front(); }
+            clock = end;
             duration = None;
         }
     }
-    title_is_ad || body.lines().filter_map(|l| l.strip_prefix("#EXT-X-DATERANGE:")).any(|attrs| {
-        let ad = hls_attr(attrs, "CLASS") == Some("twitch-stitched-ad")
-            || hls_attr(attrs, "ID").is_some_and(|id| id.starts_with("stitched-ad-"));
+    segments.iter().any(|s| s.2) || ranges.iter().any(|range| {
+        let ad = range.class == Some("twitch-stitched-ad")
+            || range.id.is_some_and(|id| id.starts_with("stitched-ad-"));
         if !ad { return false; }
-        let start = hls_attr(attrs, "START-DATE").and_then(hls_time);
-        let end = hls_attr(attrs, "END-DATE").and_then(hls_time).or_else(|| {
-            start.zip(hls_attr(attrs, "DURATION").and_then(|n| n.parse::<f64>().ok())).map(|(a, b)| a + b)
-        });
-        match (latest, start, end) {
-            (Some(t), Some(s), e) => (t >= s && e.is_none_or(|e| t < e))
-                || latest_end.is_some_and(|edge| s >= edge && s - edge <= 4.0),
+        let end = range.end.or_else(|| range.start.zip(range.duration).map(|(a, b)| a + b));
+        segments.is_empty() || segments.iter().any(|&(segment_start, segment_end, _)| match (segment_start, range.start, end) {
+            (Some(t), Some(s), e) => segment_end.is_none_or(|edge| edge > s) && e.is_none_or(|e| t < e),
             (Some(t), None, Some(e)) => t < e,
             _ => true, // Sin reloj no se declara limpia una variante con marcadores de publicidad.
-        }
+        }) || range.start.zip(segments.back().and_then(|s| s.1)).is_some_and(|(start, edge)| start >= edge && start - edge <= 4.0)
     })
 }
 
@@ -1008,17 +1042,25 @@ fn validate_alternative(body: &str) -> Result<(), String> {
 /// pide un stream anónimo (playerType "embed") para reemplazar al principal cuando hay ad.
 pub fn load_stream_clean(net: &Net, chan: String, request: u64, attempt: u64, preferred: String, height: u32) {
     net.spawn(move |net| {
-        let res = (|| {
-            let qualities = stream_qualities(&chan, None, "embed")?;
-            let selected = qualities.iter().find(|q| q.0 == preferred).or_else(|| crate::auto_pick(&qualities, height)).or(qualities.first())
-                .cloned().ok_or("Twitch no devolvió una variante alternativa")?;
-            let media = playback_agent().get(&selected.1).call().map_err(|_| "La variante alternativa no respondió")?
-                .body_mut().read_to_string().map_err(|_| "Playlist alternativa incompleta")?;
-            validate_alternative(&media)?;
-            Ok(StreamCandidate { qualities, selected })
-        })();
+        let res = stream_candidate(&chan, None, PlaybackRoute::Embed, &preferred, height);
         net.send(Ev::CleanStream(chan, request, attempt, res));
     });
+}
+
+fn stream_candidate(chan: &str, session: Option<&str>, route: PlaybackRoute, preferred: &str, height: u32) -> Result<StreamCandidate, String> {
+    let (session, player_type) = match route {
+        PlaybackRoute::Site => (session, "site"),
+        PlaybackRoute::Embed => (None, "embed"),
+    };
+    let qualities = stream_qualities(chan, session, player_type)?;
+    let selected = qualities.iter().find(|q| q.0 == preferred).or_else(|| crate::auto_pick(&qualities, height)).or(qualities.first())
+        .cloned().ok_or("Twitch no devolvió una variante de reproducción")?;
+    if route == PlaybackRoute::Embed {
+        let media = playback_agent().get(&selected.1).call().map_err(|_| "La variante alternativa no respondió")?
+            .body_mut().read_to_string().map_err(|_| "Playlist alternativa incompleta")?;
+        validate_alternative(&media)?;
+    }
+    Ok(StreamCandidate { qualities, selected, route })
 }
 
 /// (nombre de calidad, url de la variante) en el orden de la playlist (fuente primero).
@@ -1164,7 +1206,9 @@ mod tests {
         assert!(playlist_has_ad(media));
         assert!(validate_alternative(media).is_err());
         assert!(playlist_has_ad("#EXTM3U\n#EXTINF:2,Amazon\nad.ts\n"));
-        assert!(!playlist_has_ad("#EXTM3U\n#EXTINF:2,Amazon\nad.ts\n#EXTINF:2,live\nlive.ts\n"));
+        // mpv empieza en el penúltimo segmento: uno limpio al final todavía no basta.
+        assert!(playlist_has_ad("#EXTM3U\n#EXTINF:2,Amazon\nad.ts\n#EXTINF:2,live\nlive.ts\n"));
+        assert!(!playlist_has_ad("#EXTM3U\n#EXTINF:2,Amazon\nad.ts\n#EXTINF:2,live\nlive.ts\n#EXTINF:2,live\nlive2.ts\n"));
         assert!(validate_alternative("#EXTM3U\n").is_err());
         assert!(validate_alternative("#EXTM3U\n#EXTINF:2,live\na.ts\n#EXT-X-ENDLIST\n").is_err());
     }
@@ -1174,6 +1218,39 @@ mod tests {
         assert_eq!(hls_attr("ID=\"a,b\",CLASS=\"twitch-stitched-ad\",DURATION=30", "CLASS"), Some("twitch-stitched-ad"));
         assert_eq!(hls_time("2026-10-28T06:00:00.500-06:00"), hls_time("2026-10-28T12:00:00.500Z"));
         assert_eq!(hls_time("1970-01-01T00:00:00.250Z"), Some(0.25));
+    }
+
+    #[test]
+    fn a_later_daterange_update_closes_the_original_ad_marker() {
+        let media = "#EXTM3U\n#EXT-X-DATERANGE:ID=\"stitched-ad-1\",CLASS=\"twitch-stitched-ad\",START-DATE=\"2026-10-28T12:00:00Z\",PLANNED-DURATION=30\n#EXT-X-DATERANGE:ID=\"stitched-ad-1\",END-DATE=\"2026-10-28T12:00:30Z\"\n#EXT-X-PROGRAM-DATE-TIME:2026-10-28T12:00:30Z\n#EXTINF:2,live\nlive1.ts\n#EXTINF:2,live\nlive2.ts\n";
+        assert!(validate_alternative(media).is_ok());
+        // Un segmento que se solapa con el anuncio sigue siendo parte del inicio de mpv.
+        assert!(validate_alternative(&media.replace("12:00:30Z\n#EXTINF", "12:00:29Z\n#EXTINF")).is_err());
+        assert!(validate_alternative(&media.replace("END-DATE=\"2026-10-28T12:00:30Z\"", "DURATION=30")).is_ok());
+        assert!(validate_alternative(&media.replace("#EXT-X-DATERANGE:ID=\"stitched-ad-1\",END-DATE=\"2026-10-28T12:00:30Z\"\n", "")).is_err());
+    }
+
+    #[test]
+    fn validated_route_is_tried_on_the_next_channel_and_web_session_is_the_fallback() {
+        let mut calls = Vec::new();
+        for channel in ["first", "second", "third"] {
+            let result = with_playback_route(PlaybackRoute::Embed, |route| {
+                calls.push((channel, route));
+                if channel == "second" && route == PlaybackRoute::Embed {
+                    return Err("alternative contains ads or is unavailable".into());
+                }
+                Ok(route)
+            }).unwrap();
+            assert_eq!(result, if channel == "second" { PlaybackRoute::Site } else { PlaybackRoute::Embed });
+        }
+        assert_eq!(calls, [("first", PlaybackRoute::Embed), ("second", PlaybackRoute::Embed), ("second", PlaybackRoute::Site), ("third", PlaybackRoute::Embed)]);
+        let mut routes = Vec::new();
+        let result: Result<(), _> = with_playback_route(PlaybackRoute::Site, |route| {
+            routes.push(route);
+            Err("channel offline".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(routes, [PlaybackRoute::Site]);
     }
 
     #[test]
@@ -1194,6 +1271,8 @@ mod tests {
                 ("200 OK", "#EXTM3U\n#EXT-X-DATERANGE:ID=\"1\",CLASS=\"twitch-stitched-ad\"\n"),
                 ("503 Service Unavailable", "temporary outage"),
                 ("200 OK", "#EXTM3U\n#EXTINF:2,\nsegment.ts\n"),
+                ("200 OK", "#EXTM3U\n#EXT-X-DATERANGE:ID=\"2\",CLASS=\"twitch-stitched-ad\"\n"),
+                ("200 OK", "#EXTM3U\n#EXTINF:2,\nsegment2.ts\n"),
             ] {
                 let (mut socket, _) = server.accept().unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
@@ -1211,6 +1290,8 @@ mod tests {
         assert!(matches!(rx.recv_timeout(Duration::from_secs(8)).unwrap(), Ev::AdStatus(42, true)));
         // Un 503 no inventa un fin de anuncio ni mata el monitor.
         assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ev::AdStatus(42, false)));
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ev::AdStatus(42, true)));
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ev::AdStatus(42, false)));
         drop(monitor);
         serving.join().unwrap();
     }

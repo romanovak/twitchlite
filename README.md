@@ -25,9 +25,9 @@ Built with Rust, egui/eframe (OpenGL), and libmpv for video playback.
 
 ## Quick Start
 
-Download `TwitchLite-Portable-Windows.zip` from [TwitchLite Portable Windows](https://github.com/romanovak/twitchlite/releases/latest), extract, and double-click `twitchlite.exe`. Everything is included.
+Download the versioned ZIP, such as `TwitchLite-Portable-Windows-v0.1.2.zip`, from [TwitchLite Portable Windows](https://github.com/romanovak/twitchlite/releases/latest), extract, and double-click `twitchlite.exe`. Everything is included in this single download.
 
-If you run only the exe without the DLL, it will auto-download `libmpv-2.dll` on first launch. Without libmpv the app still works in chat-only mode.
+If you run only the exe without the DLL, it will retrieve `libmpv-2.dll` from that version's portable ZIP on first launch. Without libmpv the app still works in chat-only mode.
 
 ## Requirements
 
@@ -69,13 +69,15 @@ The purple refresh icon sits next to Share in the channel information below the 
 
 When the active video playlist signals an ad, the app automatically requests a fresh alternative. It checks the newest HLS segments for advertising and preloads the candidate in a muted second player. It switches only after that player has drawn moving frames, then replaces the quality list and playlist monitor together. A rejected or stalled candidate leaves the current player intact and uses increasing retry delays. Manual pause and rewind are respected. Twitch must supply live content for the alternative; an uninterrupted stream or an ad-free alternative is not guaranteed.
 
+Recovery keeps retrying if the live playlist has already moved past the ad while the player remains stuck. A playback stall also triggers the same alternative search as Skip Ad, even without an ad marker. Once an alternative has played successfully, its playback route is tried first for later refreshes and channel changes during the current app session. Each channel receives a fresh token and playlist; if that route is unavailable or contains advertising, the current web session is used as a fallback. Ad detection merges later updates to the same ad marker and checks both segments where mpv can start playback.
+
 ### Validation
 
 ```powershell
 cargo test --locked
 ```
 
-The tests cover frozen video with advancing audio, startup, retry delays, intentional pause, the refresh attention state, and an ad playlist interrupted by a simulated network failure.
+The tests cover frozen video with advancing audio, startup, retry delays, intentional pause, the refresh attention state, repeated ad breaks interrupted by a simulated network failure, delayed ad-end metadata, and playback route fallback across channel requests.
 
 For a manual recovery check with the actual libmpv runtime, launch a single app instance with local diagnostic IPC enabled, then run the helper:
 
